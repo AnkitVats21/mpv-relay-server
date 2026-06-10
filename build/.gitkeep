@@ -1,0 +1,2 @@
+# This file exists only to allow git to track the build/ directory.
+# All build artefacts inside build/ are gitignored.
