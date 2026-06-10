@@ -1,0 +1,36 @@
+# ── Binaries ─────────────────────────────────────────────────────────────────
+mpv-relay
+mpv-relay-*
+*.exe
+*.out
+
+# ── Credentials / secrets — NEVER commit these ────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Go toolchain ─────────────────────────────────────────────────────────────
+# (go.sum is intentionally tracked)
+/vendor/
+
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Logs & runtime data ───────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Local data (DB, media cache) ─────────────────────────────────────────────
+data/
+media/
+*.db
+*.db-wal
+*.db-shm
+
+# ── PID file ──────────────────────────────────────────────────────────────────
+*.pid
