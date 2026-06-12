@@ -35,28 +35,46 @@ type Config struct {
 func Load() (*Config, error) {
 	// Try loading .env from the executable's directory, then cwd.
 	exe, _ := os.Executable()
+	var envBase string // directory containing the loaded .env — used to absolutise relative paths
 	candidates := []string{
 		filepath.Join(filepath.Dir(exe), ".env"),
 		".env",
 	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			_ = godotenv.Load(p)
-			break
+		if abs, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				_ = godotenv.Load(abs)
+				envBase = filepath.Dir(abs)
+				break
+			}
 		}
+	}
+	if envBase == "" {
+		// Fall back to CWD if no .env found
+		envBase, _ = os.Getwd()
+	}
+
+	// absPath converts a value to an absolute path.
+	// Handles ~/ home expansion, then resolves relative paths against envBase.
+	absPath := func(raw string) string {
+		p := expandHome(raw)
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(envBase, p)
 	}
 
 	cfg := &Config{
-		MQTTBroker:   require("MQTT_BROKER"),
-		MQTTUsername: require("MQTT_USERNAME"),
-		MQTTPassword: require("MQTT_PASSWORD"),
-		MQTTClientID: getOr("MQTT_CLIENT_ID", "mpv-relay-server"),
-		TopicCmd:     getOr("MQTT_TOPIC_CMD", "mpv/command"),
-		TopicStatus:  getOr("MQTT_TOPIC_STATUS", "mpv/status"),
-		MPVSocket:    getOr("MPV_SOCKET", "/tmp/mpvsocket"),
-		MusicCacheDir: expandHome(getOr("MUSIC_CACHE_DIR", "~/mpv-relay/media")),
-		DBPath:        expandHome(getOr("DB_PATH", "~/mpv-relay/data/relay.db")),
-		LogPath:       expandHome(getOr("LOG_PATH", "~/mpv-relay/logs/relay.log")),
+		MQTTBroker:    require("MQTT_BROKER"),
+		MQTTUsername:  require("MQTT_USERNAME"),
+		MQTTPassword:  require("MQTT_PASSWORD"),
+		MQTTClientID:  getOr("MQTT_CLIENT_ID", "mpv-relay-server"),
+		TopicCmd:      getOr("MQTT_TOPIC_CMD", "mpv/command"),
+		TopicStatus:   getOr("MQTT_TOPIC_STATUS", "mpv/status"),
+		MPVSocket:     getOr("MPV_SOCKET", "/tmp/mpvsocket"),
+		MusicCacheDir: absPath(getOr("MUSIC_CACHE_DIR", "~/mpv-relay/media")),
+		DBPath:        absPath(getOr("DB_PATH", "~/mpv-relay/data/relay.db")),
+		LogPath:       absPath(getOr("LOG_PATH", "~/mpv-relay/logs/relay.log")),
 	}
 
 	port, err := strconv.Atoi(getOr("MQTT_PORT", "8883"))

@@ -50,7 +50,7 @@ type Manager struct {
 	autoplayOn     bool
 	autoplayPool   []*resolver.ResolvedTrack
 	nextAutoplay   *resolver.ResolvedTrack
-	ignoreNextStop bool
+	ignoreNextEOF  bool // set during track transitions to swallow spurious end-file
 	historyStack   []string
 	isNavBack      bool
 
@@ -126,13 +126,19 @@ func (m *Manager) ClearQueue() {
 	m.log.Info("Queue cleared")
 }
 
-// StopAll clears queue and stops MPV.
+// StopAll clears the queue, autoplay pool, history, and stops MPV.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	m.queue = nil
 	m.current = nil
+	m.autoplayPool = nil
+	m.nextAutoplay = nil
+	m.historyStack = nil
+	m.recordPath = ""
 	m.mu.Unlock()
 	_ = m.mpv.Stop()
+	m.log.Info("StopAll: queue, autoplay pool, and history cleared")
+	m.PublishStatus()
 }
 
 // Shuffle randomises the pending queue.
@@ -450,7 +456,6 @@ func (m *Manager) resolveAndEnqueue(query string, front bool) {
 		})
 	}
 	m.PublishStatus()
-	m.triggerPrefetch(track)
 }
 
 func (m *Manager) playNext() {
@@ -482,6 +487,14 @@ func (m *Manager) playNext() {
 
 	if isAutoplay {
 		m.log.Info("Auto-advancing via AUTOPLAY", "title", next.Title)
+		// If the track is minimal (no RelatedVideos), resolve it now so
+		// prefetchWorker can build recommendations. Should be a fast DB
+		// cache hit since enrichNextAutoplay ran in the background.
+		if next.RelatedVideos == nil {
+			if full, err := m.resolver.Resolve(next.WebpageURL); err == nil && full != nil {
+				next = full
+			}
+		}
 	} else {
 		m.log.Info("Auto-advancing via QUEUE", "title", next.Title)
 	}
@@ -491,7 +504,10 @@ func (m *Manager) playNext() {
 func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 	m.mu.Lock()
 	if m.current != nil || !m.mpv.IsIdle() {
-		m.ignoreNextStop = true
+		// A track is playing/loading; the loadfile will cause MPV to fire
+		// end-file(stop) AND potentially a synthesised end-file(eof) via the
+		// idle-active edge. Suppress both until we're settled.
+		m.ignoreNextEOF = true
 	}
 	if m.current != nil && !m.isNavBack {
 		m.historyStack = append(m.historyStack, m.current.Query)
@@ -536,17 +552,8 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 	go m.prefetchWorker(track)
 }
 
-func (m *Manager) triggerPrefetch(track *resolver.ResolvedTrack) {
-	m.mu.Lock()
-	enabled := m.autoplayOn
-	m.mu.Unlock()
-	if enabled {
-		go m.prefetchWorker(track)
-	}
-}
-
 func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
-	// Priority: prefetch next manual queue item
+	// 1. Pre-cache the next manually queued track (if any).
 	m.mu.Lock()
 	var nextQueued *resolver.ResolvedTrack
 	if len(m.queue) > 0 {
@@ -560,17 +567,13 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 			m.log.Info("Pre-cache done for queued track", "title", nextQueued.Title, "success", success)
 			m.PublishStatus()
 		})
-		return
 	}
 
-	// Build dedup set from pool + history
+	// 2. Build dedup sets from existing pool + play history.
 	m.mu.Lock()
 	poolIDs := map[string]bool{}
 	for _, t := range m.autoplayPool {
 		poolIDs[t.VideoID] = true
-	}
-	if m.nextAutoplay != nil {
-		poolIDs[m.nextAutoplay.VideoID] = true
 	}
 	m.mu.Unlock()
 
@@ -582,6 +585,7 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 		}
 	}
 
+	// 3. Filter to only genuinely new candidates.
 	var newCandidates []db.RelatedVideo
 	for _, v := range track.RelatedVideos {
 		if v.ID == "" || poolIDs[v.ID] || playedIDs[v.ID] {
@@ -596,27 +600,81 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 		return
 	}
 
-	m.log.Info("Resolving new recommendations for autoplay pool", "count", len(newCandidates))
-	for _, candidate := range newCandidates {
-		u := "https://www.youtube.com/watch?v=" + candidate.ID
-		pref, err := m.resolver.Resolve(u)
-		if err != nil || pref == nil {
-			continue
+	// 4. Add new candidates as MINIMAL tracks — zero yt-dlp calls.
+	//    Cap pool at 50 total; skip additions once full.
+	const maxPoolSize = 50
+	m.log.Info("Pooling recommendations (lazy, no yt-dlp)", "count", len(newCandidates))
+	m.mu.Lock()
+	newNextAutoplay := false
+	for _, c := range newCandidates {
+		if len(m.autoplayPool) >= maxPoolSize {
+			m.log.Info("Autoplay pool full — skipping remaining candidates", "max", maxPoolSize)
+			break
 		}
-		m.mu.Lock()
-		m.autoplayPool = append(m.autoplayPool, pref)
+		webURL := "https://www.youtube.com/watch?v=" + c.ID
+		minimal := &resolver.ResolvedTrack{
+			Query:        webURL,
+			VideoID:      c.ID,
+			Title:        c.Title,
+			Uploader:     c.Uploader,
+			Duration:     c.Duration,
+			WebpageURL:   webURL,
+			ThumbnailURL: "https://i.ytimg.com/vi/" + c.ID + "/hqdefault.jpg",
+		}
+		m.autoplayPool = append(m.autoplayPool, minimal)
 		if m.nextAutoplay == nil {
-			m.nextAutoplay = pref
+			m.nextAutoplay = minimal
+			newNextAutoplay = true
 		}
-		m.mu.Unlock()
-		m.log.Info("Added to autoplay pool", "title", pref.Title, "pool_size", len(m.autoplayPool))
-
-		pref2 := pref
-		m.resolver.StartBackgroundDownload(pref2, func(success bool) {
-			m.log.Info("Pre-cache done for autoplay track", "title", pref2.Title, "success", success)
-			m.PublishStatus()
-		})
+		m.log.Info("Pooled autoplay candidate", "title", minimal.Title, "pool_size", len(m.autoplayPool))
 	}
+	m.mu.Unlock()
+
+	// 5. Whenever nextAutoplay was just set for the first time, pre-resolve
+	//    and pre-download that track in the background (1 yt-dlp call max).
+	if newNextAutoplay {
+		go m.enrichNextAutoplay()
+	}
+	m.PublishStatus()
+}
+
+// enrichNextAutoplay resolves the first unresolved (minimal) entry in the
+// autoplay pool via a single yt-dlp call, then starts a background audio
+// download for it. All other pool entries remain minimal until they play.
+func (m *Manager) enrichNextAutoplay() {
+	m.mu.Lock()
+	if len(m.autoplayPool) == 0 {
+		m.mu.Unlock()
+		return
+	}
+	next := m.autoplayPool[0]
+	m.mu.Unlock()
+
+	if next.RelatedVideos != nil {
+		return // already fully resolved
+	}
+
+	full, err := m.resolver.Resolve(next.WebpageURL)
+	if err != nil || full == nil {
+		m.log.Warn("Could not enrich next autoplay track", "videoID", next.VideoID, "err", err)
+		return
+	}
+
+	// Replace the minimal entry with the fully resolved track.
+	m.mu.Lock()
+	if len(m.autoplayPool) > 0 && m.autoplayPool[0].VideoID == next.VideoID {
+		m.autoplayPool[0] = full
+	}
+	if m.nextAutoplay != nil && m.nextAutoplay.VideoID == next.VideoID {
+		m.nextAutoplay = full
+	}
+	m.mu.Unlock()
+
+	m.log.Info("Enriched next autoplay track", "title", full.Title)
+	m.resolver.StartBackgroundDownload(full, func(success bool) {
+		m.log.Info("Pre-cache done for next autoplay track", "title", full.Title, "success", success)
+		m.PublishStatus()
+	})
 	m.PublishStatus()
 }
 
@@ -629,10 +687,10 @@ func (m *Manager) onEOF(event map[string]any) {
 	m.log.Info("MPV end-file", "reason", reason)
 
 	m.mu.Lock()
-	if reason == "stop" && m.ignoreNextStop {
-		m.ignoreNextStop = false
+	if m.ignoreNextEOF {
+		m.ignoreNextEOF = false
 		m.mu.Unlock()
-		m.log.Info("Ignoring stop event caused by track transition")
+		m.log.Info("Ignoring spurious end-file during track transition", "reason", reason)
 		return
 	}
 	track := m.current
