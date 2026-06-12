@@ -527,6 +527,7 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 		m.log.Info("Streaming with stream-record", "title", track.Title, "record", recordPath)
 		m.mpv.Loadfile(track.WebpageURL, recordPath)
 	}
+	_ = m.mpv.Resume()
 
 	m.mu.Lock()
 	m.current = track
