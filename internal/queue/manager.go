@@ -437,12 +437,18 @@ func (m *Manager) resolveAndEnqueue(query string, front bool) {
 	}
 
 	m.mu.Lock()
+	m.removeFormAutoplayPool(track.VideoID)
 	if front {
 		m.queue = append([]*resolver.ResolvedTrack{track}, m.queue...)
 		m.log.Info("Prepended (Play Next)", "title", track.Title)
 	} else {
 		m.queue = append(m.queue, track)
 		m.log.Info("Appended to queue", "title", track.Title, "pos", len(m.queue))
+	}
+	if len(m.autoplayPool) > 0 {
+		m.nextAutoplay = m.autoplayPool[0]
+	} else {
+		m.nextAutoplay = nil
 	}
 	m.mu.Unlock()
 
@@ -503,6 +509,12 @@ func (m *Manager) playNext() {
 
 func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 	m.mu.Lock()
+	m.removeFormAutoplayPool(track.VideoID)
+	if len(m.autoplayPool) > 0 {
+		m.nextAutoplay = m.autoplayPool[0]
+	} else {
+		m.nextAutoplay = nil
+	}
 	if m.current != nil || !m.mpv.IsIdle() {
 		// A track is playing/loading; the loadfile will cause MPV to fire
 		// end-file(stop) AND potentially a synthesised end-file(eof) via the
@@ -570,10 +582,13 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 		})
 	}
 
-	// 2. Build dedup sets from existing pool + play history.
+	// 2. Build dedup sets from existing pool + play history + manual queue.
 	m.mu.Lock()
 	poolIDs := map[string]bool{}
 	for _, t := range m.autoplayPool {
+		poolIDs[t.VideoID] = true
+	}
+	for _, t := range m.queue {
 		poolIDs[t.VideoID] = true
 	}
 	m.mu.Unlock()
@@ -772,6 +787,16 @@ func (m *Manager) recoverCurrentTrack() {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+func (m *Manager) removeFormAutoplayPool(videoID string) {
+	var clean []*resolver.ResolvedTrack
+	for _, t := range m.autoplayPool {
+		if t.VideoID != videoID {
+			clean = append(clean, t)
+		}
+	}
+	m.autoplayPool = clean
+}
 
 func dbRowToTrack(row *db.SongRow) *resolver.ResolvedTrack {
 	return &resolver.ResolvedTrack{

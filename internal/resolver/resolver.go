@@ -275,11 +275,95 @@ func (r *Resolver) searchYtDlp(query string) (*ResolvedTrack, error) {
 	}, nil
 }
 
-// fetchRelatedVideos scrapes ytInitialData from the YouTube watch page.
+// fetchRelatedVideos coordinates recommendation fetching, trying YouTube Music first,
+// and falling back to standard YouTube if YTM returns nothing.
 func (r *Resolver) fetchRelatedVideos(videoID string) []db.RelatedVideo {
 	if videoID == "" {
 		return nil
 	}
+
+	// 1. Try YouTube Music first
+	related := r.fetchYTMRecommendations(videoID)
+	if len(related) > 0 {
+		r.log.Info("Fetched related videos from YouTube Music", "videoID", videoID, "count", len(related))
+		return related
+	}
+
+	r.log.Warn("YouTube Music recommendations returned empty; falling back to standard YouTube watch page", "videoID", videoID)
+
+	// 2. Fallback to standard YouTube watch page
+	return r.fetchStandardYTRecommendations(videoID)
+}
+
+// fetchYTMRecommendations scrapes ytInitialData from the YouTube Music watch page.
+func (r *Resolver) fetchYTMRecommendations(videoID string) []db.RelatedVideo {
+	watchURL := "https://music.youtube.com/watch?v=" + videoID
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", watchURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		r.log.Warn("Failed to fetch YouTube Music page", "videoID", videoID, "err", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	html := string(body)
+
+	jsonStr := extractYtInitialData(html)
+	if jsonStr == "" {
+		return nil
+	}
+
+	var ytData map[string]any
+	if err := json.Unmarshal([]byte(jsonStr), &ytData); err != nil {
+		return nil
+	}
+
+	panelVideos := findKeyRecursive(ytData, "playlistPanelVideoRenderer")
+	var related []db.RelatedVideo
+
+	for _, raw := range panelVideos {
+		renderer, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		contentID := strVal(renderer, "videoId")
+		if contentID == "" || contentID == videoID {
+			continue
+		}
+
+		title := firstNonEmpty(getText(renderer, "title"), "Unknown")
+		uploader := firstNonEmpty(getText(renderer, "shortBylineText"), getText(renderer, "longBylineText"), "Unknown")
+		durationStr := getText(renderer, "lengthText")
+		duration := 0
+		if durationStr != "" {
+			duration = parseDuration(durationStr)
+		}
+
+		related = append(related, db.RelatedVideo{
+			ID:       contentID,
+			Title:    title,
+			Uploader: uploader,
+			Duration: duration,
+		})
+	}
+
+	return related
+}
+
+// fetchStandardYTRecommendations scrapes ytInitialData from the standard YouTube watch page.
+func (r *Resolver) fetchStandardYTRecommendations(videoID string) []db.RelatedVideo {
 	watchURL := "https://www.youtube.com/watch?v=" + videoID
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -383,8 +467,27 @@ func (r *Resolver) fetchRelatedVideos(videoID string) []db.RelatedVideo {
 		})
 	}
 
-	r.log.Info("Fetched related videos", "videoID", videoID, "count", len(related))
+	r.log.Info("Fetched related videos from standard YouTube", "videoID", videoID, "count", len(related))
 	return related
+}
+
+// getText parses YouTube-formatted text objects (supporting simpleText or runs).
+func getText(m map[string]any, key string) string {
+	obj, ok := m[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if s, ok := obj["simpleText"].(string); ok && s != "" {
+		return s
+	}
+	if runs, ok := obj["runs"].([]any); ok && len(runs) > 0 {
+		if r0, ok := runs[0].(map[string]any); ok {
+			if s, ok := r0["text"].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func (r *Resolver) downloadThumbnail(thumbURL, videoID string) string {
