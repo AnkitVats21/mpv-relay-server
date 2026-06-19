@@ -50,9 +50,11 @@ type Manager struct {
 	autoplayOn     bool
 	autoplayPool   []*resolver.ResolvedTrack
 	nextAutoplay   *resolver.ResolvedTrack
-	ignoreNextEOF  bool // set during track transitions to swallow spurious end-file
-	historyStack   []string
-	isNavBack      bool
+	ignoreNextEOF             bool // set during track transitions to swallow spurious end-file
+	historyStack              []string
+	isNavBack                 bool
+	wasPlayingBeforeAssistant bool
+	assistantActive           bool
 
 	dlMu    sync.Mutex
 	dlQueue []*resolver.ResolvedTrack
@@ -101,6 +103,7 @@ func (m *Manager) PlayNow(query string) *resolver.ResolvedTrack {
 	m.queue = nil
 	m.autoplayPool = nil
 	m.nextAutoplay = nil
+	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
 	return m.resolveAndPlay(query)
 }
@@ -116,7 +119,12 @@ func (m *Manager) PlayNext(query string) {
 }
 
 // Skip stops the current track (EOF handler advances to next).
-func (m *Manager) Skip() { _ = m.mpv.Stop() }
+func (m *Manager) Skip() {
+	m.mu.Lock()
+	m.wasPlayingBeforeAssistant = false
+	m.mu.Unlock()
+	_ = m.mpv.Stop()
+}
 
 // ClearQueue removes all pending items.
 func (m *Manager) ClearQueue() {
@@ -135,6 +143,8 @@ func (m *Manager) StopAll() {
 	m.nextAutoplay = nil
 	m.historyStack = nil
 	m.recordPath = ""
+	m.wasPlayingBeforeAssistant = false
+	m.assistantActive = false
 	m.mu.Unlock()
 	_ = m.mpv.Stop()
 	m.log.Info("StopAll: queue, autoplay pool, and history cleared")
@@ -192,6 +202,7 @@ func (m *Manager) Previous() {
 	prevQuery := m.historyStack[len(m.historyStack)-1]
 	m.historyStack = m.historyStack[:len(m.historyStack)-1]
 	m.isNavBack = true
+	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
 
 	m.log.Info("Playing previous track", "query", prevQuery)
@@ -408,6 +419,13 @@ func (m *Manager) resolveAndPlay(query string) *resolver.ResolvedTrack {
 		m.log.Error("Could not resolve query", "query", query, "err", err)
 		return nil
 	}
+	if track.Duration > 1200 {
+		m.log.Warn("Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
+		if m.publish != nil {
+			m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
+		}
+		return nil
+	}
 	m.playTrack(track)
 	return track
 }
@@ -422,6 +440,14 @@ func (m *Manager) resolveAndEnqueue(query string, front bool) {
 		m.log.Error("Could not resolve queue query", "query", query)
 		if m.publish != nil {
 			m.publish(map[string]any{"type": "error", "message": "Could not resolve query: " + query})
+		}
+		return
+	}
+
+	if track.Duration > 1200 {
+		m.log.Warn("Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
+		if m.publish != nil {
+			m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
 		}
 		return
 	}
@@ -504,6 +530,13 @@ func (m *Manager) playNext() {
 	} else {
 		m.log.Info("Auto-advancing via QUEUE", "title", next.Title)
 	}
+
+	if next != nil && next.Duration > 1200 {
+		m.log.Warn("Skipping popped track exceeding 20 minutes", "title", next.Title, "duration", next.Duration)
+		m.playNext() // Try the next track
+		return
+	}
+
 	go m.playTrack(next)
 }
 
@@ -525,6 +558,12 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 		m.historyStack = append(m.historyStack, m.current.Query)
 	}
 	m.isNavBack = false
+	active := m.assistantActive
+	if active {
+		m.wasPlayingBeforeAssistant = true
+	} else {
+		m.wasPlayingBeforeAssistant = false
+	}
 	m.mu.Unlock()
 
 	var recordPath string
@@ -539,7 +578,13 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 		m.log.Info("Streaming with stream-record", "title", track.Title, "record", recordPath)
 		m.mpv.Loadfile(track.WebpageURL, recordPath)
 	}
-	_ = m.mpv.Resume()
+
+	if !active {
+		_ = m.mpv.Resume()
+	} else {
+		m.log.Info("playTrack: loading track but leaving paused since assistant is active")
+		_ = m.mpv.Pause()
+	}
 
 	m.mu.Lock()
 	m.current = track
@@ -605,6 +650,9 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 	var newCandidates []db.RelatedVideo
 	for _, v := range track.RelatedVideos {
 		if v.ID == "" || poolIDs[v.ID] || playedIDs[v.ID] {
+			continue
+		}
+		if v.Duration > 0 && v.Duration > 1200 {
 			continue
 		}
 		newCandidates = append(newCandidates, v)
@@ -673,6 +721,27 @@ func (m *Manager) enrichNextAutoplay() {
 	full, err := m.resolver.Resolve(next.WebpageURL)
 	if err != nil || full == nil {
 		m.log.Warn("Could not enrich next autoplay track", "videoID", next.VideoID, "err", err)
+		return
+	}
+
+	if full.Duration > 1200 {
+		m.log.Warn("Removing enriched autoplay track exceeding 20 minutes", "title", full.Title, "duration", full.Duration)
+		m.mu.Lock()
+		if len(m.autoplayPool) > 0 && m.autoplayPool[0].VideoID == next.VideoID {
+			m.autoplayPool = m.autoplayPool[1:]
+		}
+		if len(m.autoplayPool) > 0 {
+			m.nextAutoplay = m.autoplayPool[0]
+		} else {
+			m.nextAutoplay = nil
+		}
+		newNext := m.nextAutoplay
+		m.mu.Unlock()
+
+		m.PublishStatus()
+		if newNext != nil {
+			go m.enrichNextAutoplay()
+		}
 		return
 	}
 
@@ -833,3 +902,65 @@ func jsonMarshal(v any) json.RawMessage {
 }
 
 var _ = jsonMarshal // suppress unused warning
+
+// Pause pauses playback and resets assistant pause state.
+func (m *Manager) Pause() {
+	m.mu.Lock()
+	m.wasPlayingBeforeAssistant = false
+	m.mu.Unlock()
+	_ = m.mpv.Pause()
+}
+
+// Resume resumes playback and resets assistant pause state.
+func (m *Manager) Resume() {
+	m.mu.Lock()
+	if m.assistantActive {
+		m.wasPlayingBeforeAssistant = true
+		m.mu.Unlock()
+		m.log.Info("Resume ignored: assistant is active, but marked to play on assistant end")
+		return
+	}
+	m.wasPlayingBeforeAssistant = false
+	m.mu.Unlock()
+	_ = m.mpv.Resume()
+}
+
+// AssistantPause handles pausing for wake word/assistant conversation start.
+// It remembers if the player was currently playing so we can resume it later.
+func (m *Manager) AssistantPause() {
+	status := m.mpv.GetStatus()
+
+	m.mu.Lock()
+	m.assistantActive = true
+	if status.State == "playing" {
+		m.wasPlayingBeforeAssistant = true
+	}
+	// If the player is already paused, we keep the existing wasPlayingBeforeAssistant state.
+	// This prevents back-to-back assistant_pause commands from resetting it to false.
+	wasPlaying := m.wasPlayingBeforeAssistant
+	m.mu.Unlock()
+
+	if wasPlaying {
+		m.log.Info("AssistantPause: player was playing, pausing now")
+		_ = m.mpv.Pause()
+	} else {
+		m.log.Info("AssistantPause: player was not playing, doing nothing")
+	}
+}
+
+// AssistantPlay handles resuming after assistant conversation ends.
+// It resumes only if the player was playing before the assistant paused it.
+func (m *Manager) AssistantPlay() {
+	m.mu.Lock()
+	m.assistantActive = false
+	shouldResume := m.wasPlayingBeforeAssistant
+	m.wasPlayingBeforeAssistant = false
+	m.mu.Unlock()
+
+	if shouldResume {
+		m.log.Info("AssistantPlay: player was playing before, resuming now")
+		_ = m.mpv.Resume()
+	} else {
+		m.log.Info("AssistantPlay: player was not playing before, doing nothing")
+	}
+}

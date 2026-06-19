@@ -165,11 +165,16 @@ func (r *Resolver) SearchYouTube(query string, limit int) ([]db.RelatedVideo, er
 			continue
 		}
 		dur, _ := data["duration"].(float64)
+		durInt := int(dur)
+		if durInt > 1200 {
+			r.log.Info("Filtering out search result exceeding 20 minutes", "title", strVal(data, "title"), "duration", durInt)
+			continue
+		}
 		results = append(results, db.RelatedVideo{
 			ID:       strVal(data, "id"),
 			Title:    strVal(data, "title"),
 			Uploader: firstNonEmpty(strVal(data, "uploader"), strVal(data, "channel")),
-			Duration: int(dur),
+			Duration: durInt,
 		})
 	}
 	return results, nil
@@ -282,17 +287,27 @@ func (r *Resolver) fetchRelatedVideos(videoID string) []db.RelatedVideo {
 		return nil
 	}
 
+	var related []db.RelatedVideo
 	// 1. Try YouTube Music first
-	related := r.fetchYTMRecommendations(videoID)
+	related = r.fetchYTMRecommendations(videoID)
 	if len(related) > 0 {
 		r.log.Info("Fetched related videos from YouTube Music", "videoID", videoID, "count", len(related))
-		return related
+	} else {
+		r.log.Warn("YouTube Music recommendations returned empty; falling back to standard YouTube watch page", "videoID", videoID)
+		// 2. Fallback to standard YouTube watch page
+		related = r.fetchStandardYTRecommendations(videoID)
 	}
 
-	r.log.Warn("YouTube Music recommendations returned empty; falling back to standard YouTube watch page", "videoID", videoID)
-
-	// 2. Fallback to standard YouTube watch page
-	return r.fetchStandardYTRecommendations(videoID)
+	// Filter out recommendations exceeding 20 minutes (1200 seconds)
+	var filtered []db.RelatedVideo
+	for _, v := range related {
+		if v.Duration > 0 && v.Duration > 1200 {
+			r.log.Info("Filtering out related track exceeding 20 minutes", "title", v.Title, "duration", v.Duration)
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	return filtered
 }
 
 // fetchYTMRecommendations scrapes ytInitialData from the YouTube Music watch page.

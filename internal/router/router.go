@@ -19,7 +19,8 @@ var allowedCmds = map[string]bool{
 	"next": true, "previous": true, "seek": true, "volume": true, "mute": true,
 	"shuffle": true, "clear": true, "status": true, "queue_list": true,
 	"history": true, "autoplay": true, "download": true, "search": true,
-	"play_next": true, "get_cached_songs": true,
+	"play_next": true, "get_cached_songs": true, "assistant_pause": true,
+	"assistant_play": true,
 }
 
 // Router dispatches MQTT commands to queue/mpv/db handlers.
@@ -82,6 +83,10 @@ func (r *Router) run(cmd string, p map[string]any) {
 		r.cmdPause()
 	case "resume":
 		r.cmdResume()
+	case "assistant_pause":
+		r.cmdAssistantPause()
+	case "assistant_play":
+		r.cmdAssistantPlay()
 	case "stop":
 		r.cmdStop()
 	case "next":
@@ -145,13 +150,21 @@ func (r *Router) cmdQueue(p map[string]any) {
 }
 
 func (r *Router) cmdPause() {
-	_ = r.mpv.Pause()
+	r.q.Pause()
 	r.publish(map[string]any{"type": "state", "state": "paused"})
 }
 
 func (r *Router) cmdResume() {
-	_ = r.mpv.Resume()
+	r.q.Resume()
 	r.publish(map[string]any{"type": "state", "state": "playing"})
+}
+
+func (r *Router) cmdAssistantPause() {
+	r.q.AssistantPause()
+}
+
+func (r *Router) cmdAssistantPlay() {
+	r.q.AssistantPlay()
 }
 
 func (r *Router) cmdStop() {
