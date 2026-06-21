@@ -98,24 +98,24 @@ func (m *Manager) IsAutoplayEnabled() bool {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 // PlayNow resolves a query and starts playing immediately (clears queue + pool).
-func (m *Manager) PlayNow(query string) *resolver.ResolvedTrack {
+func (m *Manager) PlayNow(query string, download bool) *resolver.ResolvedTrack {
 	m.mu.Lock()
 	m.queue = nil
 	m.autoplayPool = nil
 	m.nextAutoplay = nil
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
-	return m.resolveAndPlay(query)
+	return m.resolveAndPlay(query, download)
 }
 
 // QueueAdd appends a query to the end of the queue.
-func (m *Manager) QueueAdd(query string) {
-	go m.resolveAndEnqueue(query, false)
+func (m *Manager) QueueAdd(query string, download bool) {
+	go m.resolveAndEnqueue(query, false, download)
 }
 
 // PlayNext prepends a query to the front of the queue.
-func (m *Manager) PlayNext(query string) {
-	go m.resolveAndEnqueue(query, true)
+func (m *Manager) PlayNext(query string, download bool) {
+	go m.resolveAndEnqueue(query, true, download)
 }
 
 // Skip stops the current track (EOF handler advances to next).
@@ -206,7 +206,7 @@ func (m *Manager) Previous() {
 	m.mu.Unlock()
 
 	m.log.Info("Playing previous track", "query", prevQuery)
-	go m.resolveAndPlay(prevQuery)
+	go m.resolveAndPlay(prevQuery, true)
 }
 
 // PublishStatus broadcasts a full status payload on the MQTT status topic.
@@ -413,11 +413,14 @@ func (m *Manager) SearchSongs(query string) {
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-func (m *Manager) resolveAndPlay(query string) *resolver.ResolvedTrack {
+func (m *Manager) resolveAndPlay(query string, download bool) *resolver.ResolvedTrack {
 	track, err := m.resolver.Resolve(query)
 	if err != nil || track == nil {
 		m.log.Error("Could not resolve query", "query", query, "err", err)
 		return nil
+	}
+	if !download {
+		track.SkipDownload = true
 	}
 	if track.Duration > 1200 {
 		m.log.Warn("Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
@@ -430,7 +433,7 @@ func (m *Manager) resolveAndPlay(query string) *resolver.ResolvedTrack {
 	return track
 }
 
-func (m *Manager) resolveAndEnqueue(query string, front bool) {
+func (m *Manager) resolveAndEnqueue(query string, front bool, download bool) {
 	if m.publish != nil {
 		m.publish(map[string]any{"type": "resolving", "query": query})
 	}
@@ -442,6 +445,9 @@ func (m *Manager) resolveAndEnqueue(query string, front bool) {
 			m.publish(map[string]any{"type": "error", "message": "Could not resolve query: " + query})
 		}
 		return
+	}
+	if !download {
+		track.SkipDownload = true
 	}
 
 	if track.Duration > 1200 {
@@ -573,6 +579,9 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 	} else if m.resolver.IsDownloading(track.VideoID) {
 		m.log.Info("Streaming directly (BG download in progress)", "title", track.Title)
 		m.mpv.Loadfile(track.WebpageURL, "")
+	} else if track.SkipDownload {
+		m.log.Info("Streaming directly (SkipDownload is true)", "title", track.Title)
+		m.mpv.Loadfile(track.WebpageURL, "")
 	} else {
 		recordPath = filepath.Join(m.cfg.MusicCacheDir, track.VideoID+".mkv")
 		m.log.Info("Streaming with stream-record", "title", track.Title, "record", recordPath)
@@ -620,11 +629,15 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 	m.mu.Unlock()
 
 	if nextQueued != nil {
-		m.log.Info("Prefetching next queued track", "title", nextQueued.Title)
-		m.resolver.StartBackgroundDownload(nextQueued, func(success bool) {
-			m.log.Info("Pre-cache done for queued track", "title", nextQueued.Title, "success", success)
-			m.PublishStatus()
-		})
+		if !nextQueued.SkipDownload {
+			m.log.Info("Prefetching next queued track", "title", nextQueued.Title)
+			m.resolver.StartBackgroundDownload(nextQueued, func(success bool) {
+				m.log.Info("Pre-cache done for queued track", "title", nextQueued.Title, "success", success)
+				m.PublishStatus()
+			})
+		} else {
+			m.log.Info("Skipping prefetch for queued track because SkipDownload is true", "title", nextQueued.Title)
+		}
 	}
 
 	// 2. Build dedup sets from existing pool + play history + manual queue.

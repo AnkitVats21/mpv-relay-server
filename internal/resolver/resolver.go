@@ -34,6 +34,7 @@ type ResolvedTrack struct {
 	ThumbnailPath string
 	ThumbnailURL  string
 	RelatedVideos []db.RelatedVideo
+	SkipDownload  bool
 }
 
 // Resolver resolves queries via yt-dlp, manages thumbnail downloads and

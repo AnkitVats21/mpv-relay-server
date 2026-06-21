@@ -132,8 +132,14 @@ func (r *Router) cmdPlay(p map[string]any) {
 		r.publish(map[string]any{"type": "error", "message": "'play' requires a 'query' field"})
 		return
 	}
+	download := true
+	if val, ok := p["download"]; ok {
+		if b, ok2 := val.(bool); ok2 {
+			download = b
+		}
+	}
 	r.publish(map[string]any{"type": "resolving", "query": query})
-	track := r.q.PlayNow(query)
+	track := r.q.PlayNow(query, download)
 	if track == nil {
 		r.publish(map[string]any{"type": "error", "message": "Could not find: '" + query + "'"})
 	}
@@ -145,8 +151,14 @@ func (r *Router) cmdQueue(p map[string]any) {
 		r.publish(map[string]any{"type": "error", "message": "'queue' requires a 'query' field"})
 		return
 	}
+	download := true
+	if val, ok := p["download"]; ok {
+		if b, ok2 := val.(bool); ok2 {
+			download = b
+		}
+	}
 	r.publish(map[string]any{"type": "resolving", "query": query})
-	r.q.QueueAdd(query)
+	r.q.QueueAdd(query, download)
 }
 
 func (r *Router) cmdPause() {
@@ -295,7 +307,13 @@ func (r *Router) cmdPlayNext(p map[string]any) {
 		r.publish(map[string]any{"type": "error", "message": "Missing 'query' for play_next command"})
 		return
 	}
-	r.q.PlayNext(query)
+	download := true
+	if val, ok := p["download"]; ok {
+		if b, ok2 := val.(bool); ok2 {
+			download = b
+		}
+	}
+	r.q.PlayNext(query, download)
 }
 
 func (r *Router) cmdGetCachedSongs(p map[string]any) {
