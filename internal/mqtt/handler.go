@@ -16,16 +16,16 @@ import (
 type Handler struct {
 	client    pahomqtt.Client
 	cfg       *config.Config
-	onCommand func(payload string)
+	onMessage func(topic string, payload []byte)
 	log       *slog.Logger
 }
 
-// New creates a Handler. onCommand is called for every message on TopicCmd.
+// New creates a Handler. onMessage is called for every message on subscribed topics.
 // Call Connect() to actually connect.
-func New(cfg *config.Config, onCommand func(string)) *Handler {
+func New(cfg *config.Config, onMessage func(string, []byte)) *Handler {
 	h := &Handler{
 		cfg:       cfg,
-		onCommand: onCommand,
+		onMessage: onMessage,
 		log:       slog.Default().With("pkg", "mqtt"),
 	}
 
@@ -80,6 +80,16 @@ func (h *Handler) PublishJSON(payload map[string]any, retain ...bool) {
 	}
 }
 
+// PublishRaw publishes raw bytes to an arbitrary topic.
+func (h *Handler) PublishRaw(topic string, data []byte, retain ...bool) {
+	r := len(retain) > 0 && retain[0]
+	token := h.client.Publish(topic, 1, r, data)
+	token.Wait()
+	if err := token.Error(); err != nil {
+		h.log.Error("MQTT publish raw error", "topic", topic, "err", err)
+	}
+}
+
 // PublishOnline announces the relay as online (clears retained LWT).
 func (h *Handler) PublishOnline() {
 	h.PublishJSON(map[string]any{"state": "online", "source": "mpv-relay"}, true)
@@ -94,12 +104,21 @@ func (h *Handler) PublishError(message string) {
 
 func (h *Handler) onConnect(client pahomqtt.Client) {
 	h.log.Info("MQTT connected — subscribing", "topic", h.cfg.TopicCmd)
-	token := client.Subscribe(h.cfg.TopicCmd, 1, h.onMessage)
+	token := client.Subscribe(h.cfg.TopicCmd, 1, h.onMsgReceived)
 	token.Wait()
 	if err := token.Error(); err != nil {
-		h.log.Error("MQTT subscribe failed", "err", err)
-		return
+		h.log.Error("MQTT subscribe cmd failed", "err", err)
 	}
+
+	for _, t := range []string{"device/waveshare/config/status", "device/waveshare/gemini/status"} {
+		h.log.Info("MQTT connected — subscribing", "topic", t)
+		tok := client.Subscribe(t, 1, h.onMsgReceived)
+		tok.Wait()
+		if err := tok.Error(); err != nil {
+			h.log.Error("MQTT subscribe config status failed", "topic", t, "err", err)
+		}
+	}
+
 	h.PublishOnline()
 }
 
@@ -111,10 +130,11 @@ func (h *Handler) onDisconnect(_ pahomqtt.Client, err error) {
 	}
 }
 
-func (h *Handler) onMessage(_ pahomqtt.Client, msg pahomqtt.Message) {
-	payload := string(msg.Payload())
-	h.log.Debug("MQTT ←", "topic", msg.Topic(), "payload", payload)
-	if h.onCommand != nil {
-		h.onCommand(payload)
+func (h *Handler) onMsgReceived(_ pahomqtt.Client, msg pahomqtt.Message) {
+	topic := msg.Topic()
+	payload := msg.Payload()
+	h.log.Debug("MQTT ←", "topic", topic, "payload", string(payload))
+	if h.onMessage != nil {
+		h.onMessage(topic, payload)
 	}
 }

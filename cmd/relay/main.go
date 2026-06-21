@@ -22,6 +22,8 @@ import (
 
 	"gopkg.in/natefinch/lumberjack.v2"
 
+	"net/http"
+
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
 	"github.com/ankitm/mpv-relay/internal/mpv"
@@ -29,6 +31,7 @@ import (
 	"github.com/ankitm/mpv-relay/internal/queue"
 	"github.com/ankitm/mpv-relay/internal/resolver"
 	"github.com/ankitm/mpv-relay/internal/router"
+	"github.com/ankitm/mpv-relay/internal/ws"
 )
 
 const pidFile = "/tmp/mpv-relay.pid"
@@ -70,18 +73,62 @@ func main() {
 	mpvClient := mpv.New(cfg.MPVSocket)
 	res := resolver.New(database, cfg)
 
-	// mqtt handler needs publish_fn; create with a no-op first, then replace.
+	// Both MQTT & WS handlers need publish_fn and publish_mqtt_raw; create with no-ops first, then replace.
 	var mqttH *mqtthandler.Handler
+	var wsHub *ws.Hub
+
 	publishFn := func(payload map[string]any) {
 		if mqttH != nil {
 			mqttH.PublishJSON(payload)
 		}
+		if wsHub != nil {
+			wsHub.BroadcastJSON(payload)
+		}
+	}
+
+	publishMqttRawFn := func(topic string, data []byte) {
+		if mqttH != nil {
+			mqttH.PublishRaw(topic, data)
+		}
 	}
 
 	qMgr := queue.New(mpvClient, res, database, cfg, publishFn)
-	rtr := router.New(qMgr, mpvClient, database, publishFn)
+	rtr := router.New(qMgr, mpvClient, database, publishFn, publishMqttRawFn)
 
-	mqttH = mqtthandler.New(cfg, rtr.Dispatch)
+	// Initialize WebSocket hub
+	wsHub = ws.NewHub(rtr.Dispatch)
+	go wsHub.Run()
+
+	// WebSocket HTTP route
+	http.Handle("/ws", wsHub)
+	go func() {
+		log.Info("Starting WebSocket server", "addr", cfg.WSAddr)
+		if err := http.ListenAndServe(cfg.WSAddr, nil); err != nil {
+			log.Error("WebSocket server HTTP listen failed", "err", err)
+		}
+	}()
+
+	// Initialize MQTT client
+	mqttMsgHandler := func(topic string, payload []byte) {
+		if topic == cfg.TopicCmd {
+			rtr.Dispatch(string(payload))
+		} else if topic == "device/waveshare/config/status" {
+			if wsHub != nil {
+				wsHub.BroadcastJSON(map[string]any{
+					"type":    "device_config",
+					"content": string(payload),
+				})
+			}
+		} else if topic == "device/waveshare/gemini/status" {
+			if wsHub != nil {
+				wsHub.BroadcastJSON(map[string]any{
+					"type":    "gemini_config",
+					"content": string(payload),
+				})
+			}
+		}
+	}
+	mqttH = mqtthandler.New(cfg, mqttMsgHandler)
 
 	// ── Connect ───────────────────────────────────────────────────────────────
 	if err := mqttH.Connect(); err != nil {

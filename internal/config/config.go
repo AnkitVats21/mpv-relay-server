@@ -24,6 +24,9 @@ type Config struct {
 	// MPV
 	MPVSocket string
 
+	// WebSocket
+	WSAddr string
+
 	// Paths
 	MusicCacheDir string
 	DBPath        string
@@ -72,6 +75,7 @@ func Load() (*Config, error) {
 		TopicCmd:      getOr("MQTT_TOPIC_CMD", "mpv/command"),
 		TopicStatus:   getOr("MQTT_TOPIC_STATUS", "mpv/status"),
 		MPVSocket:     getOr("MPV_SOCKET", "/tmp/mpvsocket"),
+		WSAddr:        getOr("WS_ADDR", ":9000"),
 		MusicCacheDir: absPath(getOr("MUSIC_CACHE_DIR", "~/mpv-relay/media")),
 		DBPath:        absPath(getOr("DB_PATH", "~/mpv-relay/data/relay.db")),
 		LogPath:       absPath(getOr("LOG_PATH", "~/mpv-relay/logs/relay.log")),

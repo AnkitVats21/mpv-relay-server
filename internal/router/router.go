@@ -21,25 +21,29 @@ var allowedCmds = map[string]bool{
 	"history": true, "autoplay": true, "download": true, "search": true,
 	"play_next": true, "get_cached_songs": true, "assistant_pause": true,
 	"assistant_play": true,
+	"device_config_get": true, "device_config_set": true,
+	"gemini_config_get": true, "gemini_config_set": true,
 }
 
 // Router dispatches MQTT commands to queue/mpv/db handlers.
 type Router struct {
-	q       *queue.Manager
-	mpv     *mpv.Client
-	db      *db.DB
-	publish func(map[string]any)
-	log     *slog.Logger
+	q              *queue.Manager
+	mpv            *mpv.Client
+	db             *db.DB
+	publish        func(map[string]any)
+	publishMqttRaw func(string, []byte)
+	log            *slog.Logger
 }
 
 // New creates a Router.
-func New(q *queue.Manager, m *mpv.Client, database *db.DB, publish func(map[string]any)) *Router {
+func New(q *queue.Manager, m *mpv.Client, database *db.DB, publish func(map[string]any), publishMqttRaw func(string, []byte)) *Router {
 	return &Router{
-		q:       q,
-		mpv:     m,
-		db:      database,
-		publish: publish,
-		log:     slog.Default().With("pkg", "router"),
+		q:              q,
+		mpv:            m,
+		db:             database,
+		publish:        publish,
+		publishMqttRaw: publishMqttRaw,
+		log:            slog.Default().With("pkg", "router"),
 	}
 }
 
@@ -119,6 +123,14 @@ func (r *Router) run(cmd string, p map[string]any) {
 		r.cmdPlayNext(p)
 	case "get_cached_songs":
 		r.cmdGetCachedSongs(p)
+	case "device_config_get":
+		r.cmdDeviceConfigGet()
+	case "device_config_set":
+		r.cmdDeviceConfigSet(p)
+	case "gemini_config_get":
+		r.cmdGeminiConfigGet()
+	case "gemini_config_set":
+		r.cmdGeminiConfigSet(p)
 	default:
 		r.publish(map[string]any{"type": "error", "message": "Unhandled command: " + cmd})
 	}
@@ -366,6 +378,32 @@ func (r *Router) cmdGetCachedSongs(p map[string]any) {
 		"has_more": hasMore,
 		"items":    items,
 	})
+}
+
+func (r *Router) cmdDeviceConfigGet() {
+	if r.publishMqttRaw != nil {
+		r.publishMqttRaw("device/waveshare/config/get", []byte{})
+	}
+}
+
+func (r *Router) cmdDeviceConfigSet(p map[string]any) {
+	content := strVal(p, "content")
+	if r.publishMqttRaw != nil {
+		r.publishMqttRaw("device/waveshare/config/set", []byte(content))
+	}
+}
+
+func (r *Router) cmdGeminiConfigGet() {
+	if r.publishMqttRaw != nil {
+		r.publishMqttRaw("device/waveshare/gemini/get", []byte{})
+	}
+}
+
+func (r *Router) cmdGeminiConfigSet(p map[string]any) {
+	content := strVal(p, "content")
+	if r.publishMqttRaw != nil {
+		r.publishMqttRaw("device/waveshare/gemini/set", []byte(content))
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
