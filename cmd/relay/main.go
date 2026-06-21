@@ -78,9 +78,9 @@ func main() {
 	var wsHub *ws.Hub
 
 	publishFn := func(payload map[string]any) {
-		if mqttH != nil {
-			mqttH.PublishJSON(payload)
-		}
+		// if mqttH != nil {
+		// 	mqttH.PublishJSON(payload)
+		// }
 		if wsHub != nil {
 			wsHub.BroadcastJSON(payload)
 		}
