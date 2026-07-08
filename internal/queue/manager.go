@@ -209,24 +209,40 @@ func (m *Manager) Previous() {
 	go m.resolveAndPlay(prevQuery, true)
 }
 
-// PublishStatus broadcasts a full status payload on the MQTT status topic.
-func (m *Manager) PublishStatus() {
+// PublishPlaybackState broadcasts only the playback metrics.
+func (m *Manager) PublishPlaybackState() {
 	if m.publish == nil {
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			m.log.Error("PublishStatus panic", "err", r)
+			m.log.Error("PublishPlaybackState panic", "err", r)
 		}
 	}()
 
 	status := m.mpv.GetStatus()
-	payload := map[string]any{
+	m.publish(map[string]any{
 		"type":     "status",
 		"state":    status.State,
 		"position": status.Position,
 		"duration": status.Duration,
 		"volume":   status.Volume,
+	})
+}
+
+// PublishTrackInfo broadcasts current track details.
+func (m *Manager) PublishTrackInfo() {
+	if m.publish == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error("PublishTrackInfo panic", "err", r)
+		}
+	}()
+
+	payload := map[string]any{
+		"type": "status",
 	}
 
 	current := m.CurrentTrack()
@@ -252,7 +268,27 @@ func (m *Manager) PublishStatus() {
 			})
 		}
 		payload["related_videos"] = related
+	} else {
+		payload["title"] = "No Track Playing"
+		payload["uploader"] = "Unknown Uploader"
+		payload["thumbnail_path"] = ""
+		payload["thumbnail_url"] = nil
+		payload["related_videos"] = []any{}
 	}
+
+	m.publish(payload)
+}
+
+// PublishQueueInfo broadcasts manual queue and autoplay pool items.
+func (m *Manager) PublishQueueInfo() {
+	if m.publish == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error("PublishQueueInfo panic", "err", r)
+		}
+	}()
 
 	m.mu.Lock()
 	qLen := len(m.queue)
@@ -261,8 +297,11 @@ func (m *Manager) PublishStatus() {
 	autoplayOn := m.autoplayOn
 	m.mu.Unlock()
 
-	payload["queue_length"] = qLen
-	payload["autoplay"] = autoplayOn
+	payload := map[string]any{
+		"type":         "status",
+		"queue_length": qLen,
+		"autoplay":     autoplayOn,
+	}
 
 	if nextAP != nil {
 		payload["next_autoplay"] = map[string]any{
@@ -310,6 +349,13 @@ func (m *Manager) PublishStatus() {
 	payload["up_next"] = upNext
 
 	m.publish(payload)
+}
+
+// PublishStatus broadcasts all status updates separately to restore client state.
+func (m *Manager) PublishStatus() {
+	m.PublishPlaybackState()
+	m.PublishTrackInfo()
+	m.PublishQueueInfo()
 }
 
 // ── Download queue ────────────────────────────────────────────────────────────
@@ -493,7 +539,7 @@ func (m *Manager) resolveAndEnqueue(query string, front bool, download bool) {
 			"insert_at_front": front,
 		})
 	}
-	m.PublishStatus()
+	m.PublishQueueInfo()
 }
 
 func (m *Manager) playNext() {
@@ -633,7 +679,7 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 			m.log.Info("Prefetching next queued track", "title", nextQueued.Title)
 			m.resolver.StartBackgroundDownload(nextQueued, func(success bool) {
 				m.log.Info("Pre-cache done for queued track", "title", nextQueued.Title, "success", success)
-				m.PublishStatus()
+				m.PublishQueueInfo()
 			})
 		} else {
 			m.log.Info("Skipping prefetch for queued track because SkipDownload is true", "title", nextQueued.Title)
@@ -712,7 +758,7 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 	if newNextAutoplay {
 		go m.enrichNextAutoplay()
 	}
-	m.PublishStatus()
+	m.PublishQueueInfo()
 }
 
 // enrichNextAutoplay resolves the first unresolved (minimal) entry in the
@@ -751,7 +797,7 @@ func (m *Manager) enrichNextAutoplay() {
 		newNext := m.nextAutoplay
 		m.mu.Unlock()
 
-		m.PublishStatus()
+		m.PublishQueueInfo()
 		if newNext != nil {
 			go m.enrichNextAutoplay()
 		}
@@ -771,9 +817,9 @@ func (m *Manager) enrichNextAutoplay() {
 	m.log.Info("Enriched next autoplay track", "title", full.Title)
 	m.resolver.StartBackgroundDownload(full, func(success bool) {
 		m.log.Info("Pre-cache done for next autoplay track", "title", full.Title, "success", success)
-		m.PublishStatus()
+		m.PublishQueueInfo()
 	})
-	m.PublishStatus()
+	m.PublishQueueInfo()
 }
 
 // onEOF handles MPV end-file events.

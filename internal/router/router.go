@@ -263,7 +263,7 @@ func (r *Router) cmdAutoplay(p map[string]any) {
 		}
 	}
 	r.q.SetAutoplay(enabled)
-	r.q.PublishStatus()
+	r.q.PublishQueueInfo()
 }
 
 func (r *Router) cmdQueueList() {

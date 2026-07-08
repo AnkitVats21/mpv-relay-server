@@ -1,0 +1,393 @@
+{
+  "assistant": [
+    {
+      "name": "play",
+      "description": "Plays a track immediately (clears the queue). Resolves plain text search queries or plays from local cache. Pass the user's requested song title/artist directly.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Rick Astley Never Gonna Give You Up' or 'classical jazz'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "queue",
+      "description": "Appends a track to the end of the current queue. Playback starts immediately if nothing is currently playing.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Lofi hip hop mix'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "play_next",
+      "description": "Queues a track at the very front of the queue to be played immediately after the current song finishes.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Blinding Lights'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "pause",
+      "description": "Pauses current media playback.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "resume",
+      "description": "Resumes current media playback if paused.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "stop",
+      "description": "Stops all playback and fully clears the playback state, queue, and autoplay pool.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "next",
+      "description": "Skips the current track and advances to the next track in the queue or autoplay pool.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "previous",
+      "description": "Returns playback to the previous track from history.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "seek",
+      "description": "Seeks to a specific position in seconds within the current track.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "seconds": {
+            "type": "NUMBER",
+            "description": "Position in seconds to seek to."
+          }
+        },
+        "required": [
+          "seconds"
+        ]
+      }
+    },
+    {
+      "name": "volume",
+      "description": "Adjusts the volume level of the player.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "level": {
+            "type": "NUMBER",
+            "description": "Target volume level percentage (0-100)."
+          }
+        },
+        "required": [
+          "level"
+        ]
+      }
+    },
+    {
+      "name": "mute",
+      "description": "Toggles the mute state on or off.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "shuffle",
+      "description": "Randomizes the order of all tracks currently in the manual play queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "clear",
+      "description": "Clears all tracks from the manual play queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "autoplay",
+      "description": "Enables or disables autoplay recommendations when the manual queue runs dry.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "enabled": {
+            "type": "BOOLEAN",
+            "description": "Set to true to enable autoplay, or false to disable it."
+          }
+        }
+      }
+    }
+  ],
+  "web": [
+    {
+      "name": "play",
+      "description": "Plays a track immediately (clears the queue). Resolves plain text search queries or plays from local cache. Pass the user's requested song title/artist directly.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Rick Astley Never Gonna Give You Up' or 'classical jazz'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "queue",
+      "description": "Appends a track to the end of the current queue. Playback starts immediately if nothing is currently playing.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Lofi hip hop mix'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "play_next",
+      "description": "Queues a track at the very front of the queue to be played immediately after the current song finishes.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "A plain text search query (e.g., 'Blinding Lights'). Do not guess or generate video IDs or URLs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "pause",
+      "description": "Pauses current media playback.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "resume",
+      "description": "Resumes current media playback if paused.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "stop",
+      "description": "Stops all playback and fully clears the playback state, queue, and autoplay pool.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "next",
+      "description": "Skips the current track and advances to the next track in the queue or autoplay pool.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "previous",
+      "description": "Returns playback to the previous track from history.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "seek",
+      "description": "Seeks to a specific position in seconds within the current track.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "seconds": {
+            "type": "NUMBER",
+            "description": "Position in seconds to seek to."
+          }
+        },
+        "required": [
+          "seconds"
+        ]
+      }
+    },
+    {
+      "name": "volume",
+      "description": "Adjusts the volume level of the player.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "level": {
+            "type": "NUMBER",
+            "description": "Target volume level percentage (0-100)."
+          }
+        },
+        "required": [
+          "level"
+        ]
+      }
+    },
+    {
+      "name": "mute",
+      "description": "Toggles the mute state on or off.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "shuffle",
+      "description": "Randomizes the order of all tracks currently in the manual play queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "clear",
+      "description": "Clears all tracks from the manual play queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "autoplay",
+      "description": "Enables or disables autoplay recommendations when the manual queue runs dry.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "enabled": {
+            "type": "BOOLEAN",
+            "description": "Set to true to enable autoplay, or false to disable it."
+          }
+        }
+      }
+    },
+    {
+      "name": "status",
+      "description": "Requests a status update payload containing the player state, current track metadata, current position/duration, and unified up-next queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "queue_list",
+      "description": "Requests a snapshot of all items currently waiting in the manual play queue.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "history",
+      "description": "Requests the recent playback history list containing up to the last 20 resolved tracks.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {}
+      }
+    },
+    {
+      "name": "download",
+      "description": "Adds a specific YouTube video to the background download cache. Note: The model cannot guess the video_id. You must first call 'search' to find the video and get its 11-character video_id, or use a video_id from the current status/history.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "video_id": {
+            "type": "STRING",
+            "description": "The exact 11-character YouTube video ID (e.g. 'dQw4w9WgXcQ') discovered from a previous search or status update. Do not guess this ID."
+          }
+        },
+        "required": [
+          "video_id"
+        ]
+      }
+    },
+    {
+      "name": "search",
+      "description": "Searches YouTube for tracks matching a search term. Results (including titles and video IDs) are returned on the status topic. Use this to find a video_id for a song.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "query": {
+            "type": "STRING",
+            "description": "The plain text search keywords to look up on YouTube to find tracks and their video IDs."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "get_cached_songs",
+      "description": "Requests a paginated list of all tracks cached locally on disk.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "page": {
+            "type": "NUMBER",
+            "description": "The page number to retrieve (1-indexed, defaults to 1)."
+          },
+          "limit": {
+            "type": "NUMBER",
+            "description": "The maximum number of cached songs to return per page (defaults to 20)."
+          }
+        }
+      }
+    }
+  ]
+}
