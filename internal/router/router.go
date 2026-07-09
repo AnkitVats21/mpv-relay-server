@@ -6,12 +6,15 @@ package router
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/ankitm/mpv-relay/internal/db"
-	"github.com/ankitm/mpv-relay/internal/mpv"
 	"github.com/ankitm/mpv-relay/internal/queue"
+	"github.com/ankitm/mpv-relay/internal/streamer"
 )
 
 var allowedCmds = map[string]bool{
@@ -23,12 +26,13 @@ var allowedCmds = map[string]bool{
 	"assistant_play": true,
 	"device_config_get": true, "device_config_set": true,
 	"gemini_config_get": true, "gemini_config_set": true,
+	"stream_status": true, "prefetch_status": true, "clear_cache": true,
 }
 
-// Router dispatches MQTT commands to queue/mpv/db handlers.
+// Router dispatches MQTT commands to queue/streamer/db handlers.
 type Router struct {
 	q              *queue.Manager
-	mpv            *mpv.Client
+	streamer       *streamer.Streamer
 	db             *db.DB
 	publish        func(map[string]any)
 	publishMqttRaw func(string, []byte)
@@ -36,10 +40,10 @@ type Router struct {
 }
 
 // New creates a Router.
-func New(q *queue.Manager, m *mpv.Client, database *db.DB, publish func(map[string]any), publishMqttRaw func(string, []byte)) *Router {
+func New(q *queue.Manager, s *streamer.Streamer, database *db.DB, publish func(map[string]any), publishMqttRaw func(string, []byte)) *Router {
 	return &Router{
 		q:              q,
-		mpv:            m,
+		streamer:       s,
 		db:             database,
 		publish:        publish,
 		publishMqttRaw: publishMqttRaw,
@@ -131,6 +135,12 @@ func (r *Router) run(cmd string, p map[string]any) {
 		r.cmdGeminiConfigGet()
 	case "gemini_config_set":
 		r.cmdGeminiConfigSet(p)
+	case "stream_status":
+		r.cmdStreamStatus()
+	case "prefetch_status":
+		r.cmdPrefetchStatus()
+	case "clear_cache":
+		r.cmdClearCache(p)
 	default:
 		r.publish(map[string]any{"type": "error", "message": "Unhandled command: " + cmd})
 	}
@@ -206,38 +216,15 @@ func (r *Router) cmdPrevious() {
 }
 
 func (r *Router) cmdSeek(p map[string]any) {
-	raw, ok := p["seconds"]
-	if !ok {
-		r.publish(map[string]any{"type": "error", "message": "'seek' requires a numeric 'seconds' field"})
-		return
-	}
-	secs, ok := toFloat64(raw)
-	if !ok {
-		r.publish(map[string]any{"type": "error", "message": "'seek' seconds must be a number"})
-		return
-	}
-	_ = r.mpv.Seek(secs)
-	r.publish(map[string]any{"type": "seeked", "seconds": secs})
+	r.publish(map[string]any{"type": "error", "message": "not supported in stream mode"})
 }
 
 func (r *Router) cmdVolume(p map[string]any) {
-	raw, ok := p["level"]
-	if !ok {
-		r.publish(map[string]any{"type": "error", "message": "'volume' requires an integer 'level' field"})
-		return
-	}
-	level, ok := toFloat64(raw)
-	if !ok {
-		r.publish(map[string]any{"type": "error", "message": "'volume' level must be a number"})
-		return
-	}
-	_ = r.mpv.SetVolume(int(level))
-	r.publish(map[string]any{"type": "volume", "level": int(level)})
+	r.publish(map[string]any{"type": "error", "message": "not supported in stream mode"})
 }
 
 func (r *Router) cmdMute() {
-	_ = r.mpv.Mute()
-	r.publish(map[string]any{"type": "state", "state": "mute_toggled"})
+	r.publish(map[string]any{"type": "error", "message": "not supported in stream mode"})
 }
 
 func (r *Router) cmdShuffle() {
@@ -407,6 +394,96 @@ func (r *Router) cmdGeminiConfigSet(p map[string]any) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+func (r *Router) cmdStreamStatus() {
+	videoID, bytesSent, uptime := r.streamer.GetSessionInfo()
+	r.publish(map[string]any{
+		"type":            "stream_status",
+		"active_video_id": videoID,
+		"bytes_sent":      bytesSent,
+		"uptime_ms":       uptime.Milliseconds(),
+	})
+}
+
+func (r *Router) cmdPrefetchStatus() {
+	pending, prefetching, ready, err := r.db.GetPrefetchStatusCounts()
+	if err != nil {
+		r.publish(map[string]any{"type": "error", "message": "Failed to get prefetch status: " + err.Error()})
+		return
+	}
+	r.publish(map[string]any{
+		"type":        "prefetch_status",
+		"pending":     pending,
+		"prefetching": prefetching,
+		"ready":       ready,
+	})
+}
+
+func (r *Router) cmdClearCache(p map[string]any) {
+	videoID := strings.TrimSpace(strVal(p, "video_id"))
+	if videoID != "" {
+		row, err := r.db.LookupMediaCache(videoID)
+		if err != nil {
+			r.publish(map[string]any{"type": "error", "message": "Failed to lookup cache: " + err.Error()})
+			return
+		}
+		if row != nil && row.FilePath != "" {
+			_ = os.Remove(row.FilePath)
+		}
+		if err := r.db.DeleteCacheByVideoID(videoID); err != nil {
+			r.publish(map[string]any{"type": "error", "message": "Failed to delete from cache: " + err.Error()})
+			return
+		}
+		r.publish(map[string]any{"type": "clear_cache_success", "video_id": videoID})
+		return
+	}
+
+	if err := r.evictCacheLRU(); err != nil {
+		r.publish(map[string]any{"type": "error", "message": "Failed to evict LRU cache: " + err.Error()})
+		return
+	}
+	r.publish(map[string]any{"type": "clear_cache_success", "video_id": ""})
+}
+
+func (r *Router) evictCacheLRU() error {
+	maxBytes := int64(5368709120) // default 5 GB
+	if envVal := os.Getenv("CACHE_MAX_BYTES"); envVal != "" {
+		if val, err := strconv.ParseInt(envVal, 10, 64); err == nil {
+			maxBytes = val
+		}
+	}
+
+	totalSize, err := r.db.GetTotalCacheSize()
+	if err != nil {
+		return fmt.Errorf("failed to get total cache size: %w", err)
+	}
+
+	if totalSize <= maxBytes {
+		r.log.Info("Cache size within limits, no eviction needed", "current", totalSize, "max", maxBytes)
+		return nil
+	}
+
+	excessBytes := totalSize - maxBytes
+	r.log.Info("Cache limit exceeded, running eviction", "current", totalSize, "max", maxBytes, "excess", excessBytes)
+
+	entries, err := r.db.GetLRUMediaFiles(excessBytes)
+	if err != nil {
+		return fmt.Errorf("failed to get LRU files: %w", err)
+	}
+
+	for _, entry := range entries {
+		r.log.Info("Evicting file", "videoID", entry.VideoID, "path", entry.FilePath, "size", entry.FileSizeBytes)
+		if entry.FilePath != "" {
+			if err := os.Remove(entry.FilePath); err != nil && !os.IsNotExist(err) {
+				r.log.Warn("Failed to delete file from disk during eviction", "path", entry.FilePath, "err", err)
+			}
+		}
+		if err := r.db.DeleteCacheByVideoID(entry.VideoID); err != nil {
+			r.log.Warn("Failed to delete DB cache entry during eviction", "videoID", entry.VideoID, "err", err)
+		}
+	}
+	return nil
+}
 
 func strVal(m map[string]any, key string) string {
 	if v, ok := m[key]; ok {

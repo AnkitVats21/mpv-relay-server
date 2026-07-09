@@ -15,7 +15,6 @@ import (
 
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
-	"github.com/ankitm/mpv-relay/internal/mpv"
 	"github.com/ankitm/mpv-relay/internal/resolver"
 	"github.com/ankitm/mpv-relay/internal/resource"
 )
@@ -39,7 +38,6 @@ type QueueItem struct {
 
 // Manager is the central play queue with autoplay pool.
 type Manager struct {
-	mpv      *mpv.Client
 	resolver *resolver.Resolver
 	db       *db.DB
 	cfg      *config.Config
@@ -66,9 +64,8 @@ type Manager struct {
 }
 
 // New creates a Manager.
-func New(m *mpv.Client, res *resolver.Resolver, database *db.DB, cfg *config.Config, publish func(map[string]any), rm *resource.ResourceManager) *Manager {
+func New(res *resolver.Resolver, database *db.DB, cfg *config.Config, publish func(map[string]any), rm *resource.ResourceManager) *Manager {
 	mgr := &Manager{
-		mpv:        m,
 		resolver:   res,
 		db:         database,
 		cfg:        cfg,
@@ -628,13 +625,16 @@ func (m *Manager) PublishPlaybackState() {
 		}
 	}()
 
-	status := m.mpv.GetStatus()
+	state := "stopped"
+	if m.rm.IsLiveStreamActive() {
+		state = "playing"
+	}
 	m.publish(map[string]any{
 		"type":     "status",
-		"state":    status.State,
-		"position": status.Position,
-		"duration": status.Duration,
-		"volume":   status.Volume,
+		"state":    state,
+		"position": 0,
+		"duration": 0,
+		"volume":   100,
 	})
 }
 
@@ -1235,7 +1235,6 @@ func (m *Manager) Pause() {
 	m.mu.Lock()
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
-	_ = m.mpv.Pause()
 }
 
 // Resume resumes playback.
@@ -1249,26 +1248,24 @@ func (m *Manager) Resume() {
 	}
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
-	_ = m.mpv.Resume()
 }
 
 // AssistantPause handles pausing for wake word/assistant conversation start.
 func (m *Manager) AssistantPause() {
-	status := m.mpv.GetStatus()
+	isPlaying := m.rm.IsLiveStreamActive()
 
 	m.mu.Lock()
 	m.assistantActive = true
-	if status.State == "playing" {
+	if isPlaying {
 		m.wasPlayingBeforeAssistant = true
 	}
 	wasPlaying := m.wasPlayingBeforeAssistant
 	m.mu.Unlock()
 
 	if wasPlaying {
-		m.log.Info("AssistantPause: player was playing, pausing now")
-		_ = m.mpv.Pause()
+		m.log.Info("AssistantPause: player was playing")
 	} else {
-		m.log.Info("AssistantPause: player was not playing, doing nothing")
+		m.log.Info("AssistantPause: player was not playing")
 	}
 }
 
@@ -1281,9 +1278,8 @@ func (m *Manager) AssistantPlay() {
 	m.mu.Unlock()
 
 	if shouldResume {
-		m.log.Info("AssistantPlay: player was playing before, resuming now")
-		_ = m.mpv.Resume()
+		m.log.Info("AssistantPlay: player was playing before assistant")
 	} else {
-		m.log.Info("AssistantPlay: player was not playing before, doing nothing")
+		m.log.Info("AssistantPlay: player was not playing before assistant")
 	}
 }

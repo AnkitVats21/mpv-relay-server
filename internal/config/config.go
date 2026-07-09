@@ -35,6 +35,8 @@ type Config struct {
 
 	// Streamer
 	StreamerURL string
+	HTTPStreamPort int
+	CacheMaxBytes  int64
 }
 
 // Load reads the .env file located next to the running binary (or current dir),
@@ -92,6 +94,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid MQTT_PORT: %w", err)
 	}
 	cfg.MQTTPort = port
+
+	httpPort, err := strconv.Atoi(getOr("HTTP_STREAM_PORT", "8765"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTP_STREAM_PORT: %w", err)
+	}
+	cfg.HTTPStreamPort = httpPort
+
+	cacheMax, err := strconv.ParseInt(getOr("CACHE_MAX_BYTES", "5368709120"), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CACHE_MAX_BYTES: %w", err)
+	}
+	cfg.CacheMaxBytes = cacheMax
 
 	// Ensure directories exist
 	for _, dir := range []string{

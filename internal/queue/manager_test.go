@@ -10,7 +10,6 @@ import (
 
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
-	"github.com/ankitm/mpv-relay/internal/mpv"
 	"github.com/ankitm/mpv-relay/internal/resolver"
 	"github.com/ankitm/mpv-relay/internal/resource"
 )
@@ -69,11 +68,6 @@ func TestQueueManager(t *testing.T) {
 		MusicCacheDir:  tempDir,
 	}
 
-	// We pass a dummy socket path to mpv
-	mpvSock := filepath.Join(tempDir, "mpv.sock")
-	mpvClient := mpv.New(mpvSock)
-	defer mpvClient.Close()
-
 	res := resolver.New(d, cfg)
 	rm := resource.New()
 
@@ -85,7 +79,7 @@ func TestQueueManager(t *testing.T) {
 		mqttMu.Unlock()
 	}
 
-	mgr := New(mpvClient, res, d, cfg, publishFn, rm)
+	mgr := New(res, d, cfg, publishFn, rm)
 	streamer := &mockStreamer{}
 	mgr.SetStreamer(streamer)
 

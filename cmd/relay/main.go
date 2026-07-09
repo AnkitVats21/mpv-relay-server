@@ -13,20 +13,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 
-	"net/http"
-
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
-	"github.com/ankitm/mpv-relay/internal/mpv"
 	mqtthandler "github.com/ankitm/mpv-relay/internal/mqtt"
 	"github.com/ankitm/mpv-relay/internal/queue"
 	"github.com/ankitm/mpv-relay/internal/resource"
@@ -59,7 +58,6 @@ func main() {
 	log.Info(strings.Repeat("═", 60))
 	log.Info("  MPV Relay Server starting …")
 	log.Info("  Broker", "host", cfg.MQTTBroker, "port", cfg.MQTTPort)
-	log.Info("  Socket", "path", cfg.MPVSocket)
 	log.Info("  Cache",  "dir", cfg.MusicCacheDir)
 	log.Info("  DB",     "path", cfg.DBPath)
 	log.Info("  Logs",   "path", cfg.LogPath)
@@ -72,7 +70,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	mpvClient := mpv.New(cfg.MPVSocket)
 	res := resolver.New(database, cfg)
 
 	// Both MQTT & WS handlers need publish_fn and publish_mqtt_raw; create with no-ops first, then replace.
@@ -80,9 +77,6 @@ func main() {
 	var wsHub *ws.Hub
 
 	publishFn := func(payload map[string]any) {
-		// if mqttH != nil {
-		// 	mqttH.PublishJSON(payload)
-		// }
 		if wsHub != nil {
 			wsHub.BroadcastJSON(payload)
 		}
@@ -94,21 +88,11 @@ func main() {
 		}
 	}
 
-	// Initialize Resource Manager early
-	rm := resource.New()
-
-	qMgr := queue.New(mpvClient, res, database, cfg, publishFn, rm)
-	rtr := router.New(qMgr, mpvClient, database, publishFn, publishMqttRawFn)
-
-	// Initialize WebSocket hub
-	wsHub = ws.NewHub(rtr.Dispatch)
-	go wsHub.Run()
-
-	mux := http.NewServeMux()
-	mux.Handle("/ws", wsHub)
-
-	// Initialize MQTT client
+	var rtr *router.Router
 	mqttMsgHandler := func(topic string, payload []byte) {
+		if rtr == nil {
+			return
+		}
 		if topic == cfg.TopicCmd {
 			rtr.Dispatch(string(payload))
 		} else if topic == "device/waveshare/config/status" {
@@ -129,15 +113,26 @@ func main() {
 	}
 	mqttH = mqtthandler.New(cfg, mqttMsgHandler)
 
-	// Initialize Streamer
+	rm := resource.New()
+
 	streamerInst := streamer.New(database, rm, mqttH, cfg.MediaDir)
-	streamerInst.RegisterHTTPHandler(mux)
+
+	qMgr := queue.New(res, database, cfg, publishFn, rm)
 	qMgr.SetStreamer(streamerInst)
 
+	rtr = router.New(qMgr, streamerInst, database, publishFn, publishMqttRawFn)
+
+	// Initialize WebSocket hub
+	wsHub = ws.NewHub(rtr.Dispatch)
+	go wsHub.Run()
+
+	wsMux := http.NewServeMux()
+	wsMux.Handle("/ws", wsHub)
+
 	go func() {
-		log.Info("Starting HTTP & Streamer server", "addr", cfg.WSAddr)
-		if err := http.ListenAndServe(cfg.WSAddr, mux); err != nil {
-			log.Error("HTTP server listen failed", "err", err)
+		log.Info("Starting HTTP & WebSocket server", "addr", cfg.WSAddr)
+		if err := http.ListenAndServe(cfg.WSAddr, wsMux); err != nil {
+			log.Error("WebSocket server listen failed", "err", err)
 		}
 	}()
 
@@ -145,6 +140,26 @@ func main() {
 	if err := mqttH.Connect(); err != nil {
 		log.Error("MQTT connect failed", "err", err)
 		os.Exit(1)
+	}
+
+	// Mount HTTP stream handler
+	streamMux := http.NewServeMux()
+	streamerInst.RegisterHTTPHandler(streamMux)
+
+	// Start HTTP server in goroutine
+	go func() {
+		addr := fmt.Sprintf(":%d", cfg.HTTPStreamPort)
+		log.Info("HTTP stream server listening", "addr", addr)
+		if err := http.ListenAndServe(addr, streamMux); err != nil {
+			log.Error("HTTP server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Set GOMEMLIMIT
+	if os.Getenv("GOMEMLIMIT") == "" {
+		// Soft fallback: set it programmatically via runtime/debug
+		debug.SetMemoryLimit(350 * 1024 * 1024)
 	}
 
 	log.Info("✅ Relay active — listening", "topic", cfg.TopicCmd)
@@ -157,7 +172,6 @@ func main() {
 	log.Info("Caught signal — shutting down", "signal", sig)
 
 	mqttH.Disconnect()
-	mpvClient.Close()
 	if err := database.Close(); err != nil {
 		log.Warn("DB close error", "err", err)
 	}

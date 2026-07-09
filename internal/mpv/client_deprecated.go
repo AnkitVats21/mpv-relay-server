@@ -1,3 +1,5 @@
+//go:build ignore
+
 // Package mpv provides a JSON-RPC client for the MPV media player IPC socket.
 //
 // Features:

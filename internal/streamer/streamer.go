@@ -93,3 +93,15 @@ func (s *Streamer) StartStream(videoID, title string) error {
 		return fmt.Errorf("timeout waiting for ESP32 connection")
 	}
 }
+
+// GetSessionInfo returns the current active video ID, bytes sent, and uptime of the session.
+func (s *Streamer) GetSessionInfo() (string, int64, time.Duration) {
+	s.session.RLock()
+	defer s.session.RUnlock()
+
+	var uptime time.Duration
+	if !s.session.StartedAt.IsZero() {
+		uptime = time.Since(s.session.StartedAt)
+	}
+	return s.session.ActiveVideoID, s.session.BytesSent, uptime
+}

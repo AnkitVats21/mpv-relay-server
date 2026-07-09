@@ -419,4 +419,41 @@ func (d *DB) EnqueueTrackAtFront(track QueueEntry) (int64, error) {
 	return newID, nil
 }
 
+// GetPrefetchStatusCounts returns the count of playback_queue rows in PENDING, PREFETCHING, and READY states.
+func (d *DB) GetPrefetchStatusCounts() (pending, prefetching, ready int, err error) {
+	const q = `
+	SELECT 
+		COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status = 'PREFETCHING' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END), 0)
+	FROM playback_queue
+	`
+	err = d.db.QueryRow(q).Scan(&pending, &prefetching, &ready)
+	return pending, prefetching, ready, err
+}
+
+// DeleteCacheByVideoID deletes a cached media entry and clears file_path in song_cache.
+func (d *DB) DeleteCacheByVideoID(videoID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// 1. Delete from media_cache
+	_, err1 := d.db.Exec("DELETE FROM media_cache WHERE video_id = ?", videoID)
+	// 2. Set file_path = NULL in song_cache
+	_, err2 := d.db.Exec("UPDATE song_cache SET file_path = NULL WHERE video_id = ?", videoID)
+
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
+// GetTotalCacheSize returns the sum of file_size_bytes of all entries in media_cache.
+func (d *DB) GetTotalCacheSize() (int64, error) {
+	const q = `SELECT COALESCE(SUM(file_size_bytes), 0) FROM media_cache`
+	var sum int64
+	err := d.db.QueryRow(q).Scan(&sum)
+	return sum, err
+}
+
 
