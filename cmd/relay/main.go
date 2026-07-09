@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
+	"github.com/ankitm/mpv-relay/internal/eviction"
 	mqtthandler "github.com/ankitm/mpv-relay/internal/mqtt"
 	"github.com/ankitm/mpv-relay/internal/queue"
 	"github.com/ankitm/mpv-relay/internal/resource"
@@ -64,6 +66,9 @@ func main() {
 	log.Info(strings.Repeat("═", 60))
 
 	// ── Layer construction (dependency injection) ─────────────────────────────
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		log.Error("Failed to open database", "err", err)
@@ -122,6 +127,11 @@ func main() {
 
 	rtr = router.New(qMgr, streamerInst, database, publishFn, publishMqttRawFn)
 
+	evictWorker := eviction.New(database, cfg.CacheMaxBytes)
+	evictWorker.SetActiveTrackProvider(streamerInst)
+	rtr.SetEvictionWorker(evictWorker)
+	go evictWorker.Start(rootCtx)
+
 	// Initialize WebSocket hub
 	wsHub = ws.NewHub(rtr.Dispatch)
 	go wsHub.Run()
@@ -170,6 +180,7 @@ func main() {
 
 	sig := <-sigCh
 	log.Info("Caught signal — shutting down", "signal", sig)
+	cancel()
 
 	mqttH.Disconnect()
 	if err := database.Close(); err != nil {

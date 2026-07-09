@@ -5,14 +5,15 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/ankitm/mpv-relay/internal/db"
+	"github.com/ankitm/mpv-relay/internal/eviction"
 	"github.com/ankitm/mpv-relay/internal/queue"
 	"github.com/ankitm/mpv-relay/internal/streamer"
 )
@@ -37,6 +38,7 @@ type Router struct {
 	publish        func(map[string]any)
 	publishMqttRaw func(string, []byte)
 	log            *slog.Logger
+	evictWorker    *eviction.Worker
 }
 
 // New creates a Router.
@@ -49,6 +51,11 @@ func New(q *queue.Manager, s *streamer.Streamer, database *db.DB, publish func(m
 		publishMqttRaw: publishMqttRaw,
 		log:            slog.Default().With("pkg", "router"),
 	}
+}
+
+// SetEvictionWorker sets the eviction worker for the router.
+func (r *Router) SetEvictionWorker(w *eviction.Worker) {
+	r.evictWorker = w
 }
 
 // Dispatch is called by the MQTT handler for every incoming message.
@@ -446,43 +453,22 @@ func (r *Router) cmdClearCache(p map[string]any) {
 }
 
 func (r *Router) evictCacheLRU() error {
-	maxBytes := int64(5368709120) // default 5 GB
-	if envVal := os.Getenv("CACHE_MAX_BYTES"); envVal != "" {
-		if val, err := strconv.ParseInt(envVal, 10, 64); err == nil {
-			maxBytes = val
-		}
-	}
-
-	totalSize, err := r.db.GetTotalCacheSize()
-	if err != nil {
-		return fmt.Errorf("failed to get total cache size: %w", err)
-	}
-
-	if totalSize <= maxBytes {
-		r.log.Info("Cache size within limits, no eviction needed", "current", totalSize, "max", maxBytes)
-		return nil
-	}
-
-	excessBytes := totalSize - maxBytes
-	r.log.Info("Cache limit exceeded, running eviction", "current", totalSize, "max", maxBytes, "excess", excessBytes)
-
-	entries, err := r.db.GetLRUMediaFiles(excessBytes)
-	if err != nil {
-		return fmt.Errorf("failed to get LRU files: %w", err)
-	}
-
-	for _, entry := range entries {
-		r.log.Info("Evicting file", "videoID", entry.VideoID, "path", entry.FilePath, "size", entry.FileSizeBytes)
-		if entry.FilePath != "" {
-			if err := os.Remove(entry.FilePath); err != nil && !os.IsNotExist(err) {
-				r.log.Warn("Failed to delete file from disk during eviction", "path", entry.FilePath, "err", err)
+	w := r.evictWorker
+	if w == nil {
+		maxBytes := int64(5368709120) // default 5 GB
+		if envVal := os.Getenv("CACHE_MAX_BYTES"); envVal != "" {
+			if val, err := strconv.ParseInt(envVal, 10, 64); err == nil {
+				maxBytes = val
 			}
 		}
-		if err := r.db.DeleteCacheByVideoID(entry.VideoID); err != nil {
-			r.log.Warn("Failed to delete DB cache entry during eviction", "videoID", entry.VideoID, "err", err)
+		w = eviction.New(r.db, maxBytes)
+		if r.streamer != nil {
+			w.SetActiveTrackProvider(r.streamer)
 		}
 	}
-	return nil
+
+	_, _, err := w.RunOnce(context.Background())
+	return err
 }
 
 func strVal(m map[string]any, key string) string {

@@ -456,4 +456,10 @@ func (d *DB) GetTotalCacheSize() (int64, error) {
 	return sum, err
 }
 
+// GetCacheTotalSize returns the sum of file_size_bytes for all rows in media_cache.
+func (d *DB) GetCacheTotalSize() (int64, error) {
+	return d.GetTotalCacheSize()
+}
+
+
 

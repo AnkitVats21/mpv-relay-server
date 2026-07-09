@@ -105,3 +105,11 @@ func (s *Streamer) GetSessionInfo() (string, int64, time.Duration) {
 	}
 	return s.session.ActiveVideoID, s.session.BytesSent, uptime
 }
+
+// GetActiveVideoID returns the currently streaming video's ID.
+func (s *Streamer) GetActiveVideoID() string {
+	s.session.RLock()
+	defer s.session.RUnlock()
+	return s.session.ActiveVideoID
+}
+
