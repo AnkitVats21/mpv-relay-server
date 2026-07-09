@@ -161,8 +161,8 @@ func main() {
 		addr := fmt.Sprintf(":%d", cfg.HTTPStreamPort)
 		log.Info("HTTP stream server listening", "addr", addr)
 		if err := http.ListenAndServe(addr, streamMux); err != nil {
-			log.Error("HTTP server error", "err", err)
-			os.Exit(1)
+			log.Error("HTTP stream server failed — triggering shutdown", "err", err)
+			cancel() // graceful shutdown; defers in main will close DB and remove PID file
 		}
 	}()
 

@@ -56,10 +56,10 @@ func (s *Streamer) RegisterHTTPHandler(mux *http.ServeMux) {
 // and waits for the ESP32 to connect (or times out after 10s).
 func (s *Streamer) StartStream(videoID, title string) error {
 	s.mu.Lock()
-	if s.connChan != nil {
-		// Close existing waiting channel to notify any stale waiters
-		close(s.connChan)
-	}
+	// Replace connChan without closing the old one. The previous StartStream
+	// goroutine (if any) holds a reference to the old channel via its local `ch`
+	// variable; it will time out naturally. Closing the old channel would
+	// accidentally unblock it with a zero-value receive.
 	s.connChan = make(chan struct{}, 1)
 	ch := s.connChan
 	s.mu.Unlock()

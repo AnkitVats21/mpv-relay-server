@@ -448,18 +448,12 @@ func (d *DB) DeleteCacheByVideoID(videoID string) error {
 	return err2
 }
 
-// GetTotalCacheSize returns the sum of file_size_bytes of all entries in media_cache.
-func (d *DB) GetTotalCacheSize() (int64, error) {
+// GetCacheTotalSize returns the sum of file_size_bytes for all rows in media_cache.
+func (d *DB) GetCacheTotalSize() (int64, error) {
 	const q = `SELECT COALESCE(SUM(file_size_bytes), 0) FROM media_cache`
 	var sum int64
 	err := d.db.QueryRow(q).Scan(&sum)
 	return sum, err
 }
-
-// GetCacheTotalSize returns the sum of file_size_bytes for all rows in media_cache.
-func (d *DB) GetCacheTotalSize() (int64, error) {
-	return d.GetTotalCacheSize()
-}
-
 
 

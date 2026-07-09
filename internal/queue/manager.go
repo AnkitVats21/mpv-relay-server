@@ -1034,13 +1034,32 @@ func (m *Manager) playTrackFromAutoplay(track *resolver.ResolvedTrack) {
 }
 
 func (m *Manager) monitorStreamCompletion(entryID int64) {
+	// Startup phase: wait up to 10s for the live gate to become active.
+	// (AcquireLiveStream is called inside the HTTP handler, which runs concurrently;
+	// there's a small window after StartStream returns and before the gate is held.)
+	streamWasSeen := false
 	for i := 0; i < 20; i++ {
 		if m.rm.IsLiveStreamActive() {
+			streamWasSeen = true
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	if !streamWasSeen {
+		// The live gate was never active after 10s. Either:
+		// a) The ESP32 connected and disconnected so fast that we missed it, OR
+		// b) StartStream timed out (markFailed was already called in that path).
+		// Check DB: if the row is still PLAYING, mark it COMPLETED so it unblocks the queue.
+		entry, err := m.db.GetQueueEntry(entryID)
+		if err == nil && entry != nil && entry.Status == "PLAYING" {
+			m.log.Warn("monitorStreamCompletion: stream gate never observed active; marking COMPLETED to unblock queue", "id", entryID)
+			m.markCompleted(entryID)
+		}
+		return
+	}
+
+	// Main phase: wait for the live gate to go inactive (stream ended).
 	for {
 		time.Sleep(500 * time.Millisecond)
 		if !m.rm.IsLiveStreamActive() {

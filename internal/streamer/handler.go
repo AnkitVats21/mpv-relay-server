@@ -107,7 +107,6 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Sample-Rate", "32000")
 	w.Header().Set("X-Bit-Depth", "16")
 	w.Header().Set("X-Channels", "1")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 
 	// Stream logic

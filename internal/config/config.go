@@ -86,7 +86,7 @@ func Load() (*Config, error) {
 		MediaDir:      absPath(getOr("MEDIA_DIR", "~/mpv-relay/media")),
 		DBPath:        absPath(getOr("DB_PATH", "~/mpv-relay/data/relay.db")),
 		LogPath:       absPath(getOr("LOG_PATH", "~/mpv-relay/logs/relay.log")),
-		StreamerURL:   getOr("STREAMER_URL", "http://localhost:9000"),
+		StreamerURL:   getOr("STREAMER_URL", "http://localhost:8765"),
 	}
 
 	port, err := strconv.Atoi(getOr("MQTT_PORT", "8883"))
