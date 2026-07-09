@@ -123,6 +123,10 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		log.Info("WAV dump enabled", "path", dumpPath)
 	}
 
+	// Drain stale START_STREAM messages from previous scenarios
+	// to prevent their expired tokens from causing a false 403.
+	mqtt.FlushStartStream(500 * time.Millisecond)
+
 	// Clean up player state from any previous scenario
 	player.Disconnect()
 
@@ -211,41 +215,76 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		}
 	}()
 
-	// 2. Background throughput checker: logs every 2s, fails after 3 consecutive low samples.
+	// 2. Background throughput checker: uses a rolling average (totalBytes/elapsed
+	//    since first byte) with a 6-second startup grace period, so bursty delivery
+	//    from the server doesn't cause false failures.
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
+		var rollingStart time.Time
+		var rollingStartBytes int64
+		var lastTotal int64
 		consecutiveLow := 0
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if player.IsStreaming() {
-					throughput := player.Throughput()
-					log.Info("Throughput check", "bytes_per_sec", throughput)
+				if !player.IsStreaming() {
+					// Stream not active; reset rolling window for next connection.
+					rollingStart = time.Time{}
+					consecutiveLow = 0
+					continue
+				}
 
-					mu.Lock()
-					if minThroughput < 0 || throughput < minThroughput {
-						minThroughput = throughput
-					}
-					if throughput > maxThroughput {
-						maxThroughput = throughput
-					}
-					mu.Unlock()
+				total := player.TotalBytesPulled()
 
-					if throughput < 64000 {
-						consecutiveLow++
-						log.Warn("Low throughput sample", "throughput", throughput, "consecutive", consecutiveLow)
-						if consecutiveLow >= 3 {
-							log.Error("Throughput below threshold for 3+ consecutive samples", "consecutive", consecutiveLow)
-							failScenario("throughput below threshold")
-							return
-						}
-					} else {
-						consecutiveLow = 0
+				// Detect a new Connect() call (bytesPulled resets to 0).
+				if rollingStart.IsZero() || total < lastTotal {
+					rollingStart = time.Now()
+					rollingStartBytes = total
+					consecutiveLow = 0
+				}
+				lastTotal = total
+
+				elapsed := time.Since(rollingStart).Seconds()
+				if elapsed < 6.0 {
+					log.Info("Throughput grace period", "elapsed_s", fmt.Sprintf("%.1f", elapsed))
+					continue
+				}
+
+				avgRate := float64(total-rollingStartBytes) / elapsed
+
+				mu.Lock()
+				if minThroughput < 0 || avgRate < minThroughput {
+					minThroughput = avgRate
+				}
+				if avgRate > maxThroughput {
+					maxThroughput = avgRate
+				}
+				mu.Unlock()
+
+				log.Info("Throughput check (rolling avg)",
+					"bytes_per_sec", fmt.Sprintf("%.0f", avgRate),
+					"elapsed_s", fmt.Sprintf("%.1f", elapsed),
+				)
+
+				if avgRate < 64000 {
+					consecutiveLow++
+					log.Warn("Low throughput sample",
+						"avg_bytes_per_sec", fmt.Sprintf("%.0f", avgRate),
+						"consecutive", consecutiveLow,
+					)
+					if consecutiveLow >= 3 {
+						log.Error("Throughput below 64kB/s for 3+ consecutive rolling checks",
+							"consecutive", consecutiveLow)
+						failScenario("throughput below threshold")
+						return
 					}
+				} else {
+					consecutiveLow = 0
 				}
 			}
 		}

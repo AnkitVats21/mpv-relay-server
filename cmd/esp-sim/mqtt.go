@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 
@@ -151,6 +152,21 @@ func (m *SimMQTT) onMsgReceived(_ pahomqtt.Client, msg pahomqtt.Message) {
 			}
 		}
 		m.mu.Unlock()
+	}
+}
+
+// FlushStartStream drains any START_STREAM messages that arrive within d.
+// Call this at the start of each scenario to discard stale tokens from
+// previous scenarios that the broker may still deliver.
+func (m *SimMQTT) FlushStartStream(d time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	for {
+		_, _, _, _, err := m.WaitForStartStream(ctx)
+		if err != nil {
+			return
+		}
+		m.log.Info("FlushStartStream: discarded stale START_STREAM")
 	}
 }
 

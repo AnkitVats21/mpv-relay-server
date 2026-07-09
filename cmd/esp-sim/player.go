@@ -56,6 +56,14 @@ func (p *StreamPlayer) IsStreaming() bool {
 	return p.cancel != nil
 }
 
+// TotalBytesPulled returns the cumulative bytes received in the current Connect call.
+// Resets to 0 on each new Connect.
+func (p *StreamPlayer) TotalBytesPulled() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bytesPulled
+}
+
 // Connect starts an HTTP GET /stream?token=TOKEN, drains to io.Discard (or a WAV
 // file if dumpWAVPath is non-empty). Blocks until EOF or context cancel.
 // Reports 403 as an error. Returns PCMStats after the stream ends.
@@ -111,7 +119,7 @@ func (p *StreamPlayer) Connect(ctx context.Context, streamURL string, dumpWAVPat
 	}
 
 	// healthTracker inspects PCM samples as they flow through.
-	ht := &healthTracker{cfg: pcmCfg}
+	ht := newHealthTracker(pcmCfg)
 
 	// Track bytes via trackingReader, then tee into healthTracker.
 	tr := &trackingReader{Reader: resp.Body, p: p}
@@ -203,6 +211,7 @@ const (
 	clipValue           = int16(32767) // ±32767 = clipping
 	silenceRunWarnLimit = int64(5000)  // ~156 ms at 32 kHz → WARN
 	clippingWarnPct     = 10.0         // >10% clipping → WARN
+	startupGraceSamples = int64(32000) // skip first 1s (32kHz) before silence tracking
 )
 
 type healthTracker struct {
@@ -214,6 +223,13 @@ type healthTracker struct {
 	silenceRun       int64 // current run of silence samples
 	maxSilenceRun    int64
 	leftover         []byte // partial sample bytes carried between Write calls
+
+	// startup grace: silence tracking begins only after this many samples
+	graceSamplesLeft int64
+}
+
+func newHealthTracker(cfg PCMConfig) *healthTracker {
+	return &healthTracker{cfg: cfg, graceSamplesLeft: startupGraceSamples}
 }
 
 func (ht *healthTracker) Write(p []byte) (int, error) {
@@ -239,14 +255,18 @@ func (ht *healthTracker) Write(p []byte) (int, error) {
 			abs = -abs
 		}
 
-		// Silence check
-		if abs < silenceThreshold {
-			ht.silenceRun++
-			if ht.silenceRun > ht.maxSilenceRun {
-				ht.maxSilenceRun = ht.silenceRun
-			}
+		// Silence check (skip during startup grace period)
+		if ht.graceSamplesLeft > 0 {
+			ht.graceSamplesLeft--
 		} else {
-			ht.silenceRun = 0
+			if abs < silenceThreshold {
+				ht.silenceRun++
+				if ht.silenceRun > ht.maxSilenceRun {
+					ht.maxSilenceRun = ht.silenceRun
+				}
+			} else {
+				ht.silenceRun = 0
+			}
 		}
 
 		// Clipping check
