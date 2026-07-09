@@ -80,6 +80,12 @@ func (h *Handler) PublishJSON(payload map[string]any, retain ...bool) {
 	}
 }
 
+// Publish publishes the payload to the status topic.
+func (h *Handler) Publish(payload map[string]any) {
+	h.PublishJSON(payload)
+}
+
+
 // PublishRaw publishes raw bytes to an arbitrary topic.
 func (h *Handler) PublishRaw(topic string, data []byte, retain ...bool) {
 	r := len(retain) > 0 && retain[0]

@@ -76,6 +76,37 @@ func (d *DB) TouchMediaCache(videoID string) error {
 	return err
 }
 
+// LookupMediaCache retrieves a media cache entry by video_id.
+// Returns nil, nil if the entry is not found in the cache.
+func (d *DB) LookupMediaCache(videoID string) (*MediaCacheEntry, error) {
+	const q = `
+	SELECT video_id, title, file_path, file_size_bytes, duration_seconds, last_accessed_at, created_at
+	FROM media_cache
+	WHERE video_id = ?
+	`
+	var entry MediaCacheEntry
+	var lastAccessed, createdAt time.Time
+	err := d.db.QueryRow(q, videoID).Scan(
+		&entry.VideoID,
+		&entry.Title,
+		&entry.FilePath,
+		&entry.FileSizeBytes,
+		&entry.DurationSeconds,
+		&lastAccessed,
+		&createdAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	entry.LastAccessedAt = lastAccessed
+	entry.CreatedAt = createdAt
+	return &entry, nil
+}
+
+
 // GetLRUMediaFiles returns cached media entries ordered by oldest access time until their total size meets or exceeds limitBytes.
 func (d *DB) GetLRUMediaFiles(limitBytes int64) ([]MediaCacheEntry, error) {
 	const q = `

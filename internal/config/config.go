@@ -29,8 +29,12 @@ type Config struct {
 
 	// Paths
 	MusicCacheDir string
+	MediaDir      string
 	DBPath        string
 	LogPath       string
+
+	// Streamer
+	StreamerURL string
 }
 
 // Load reads the .env file located next to the running binary (or current dir),
@@ -77,8 +81,10 @@ func Load() (*Config, error) {
 		MPVSocket:     getOr("MPV_SOCKET", "/tmp/mpvsocket"),
 		WSAddr:        getOr("WS_ADDR", ":9000"),
 		MusicCacheDir: absPath(getOr("MUSIC_CACHE_DIR", "~/mpv-relay/media")),
+		MediaDir:      absPath(getOr("MEDIA_DIR", "~/mpv-relay/media")),
 		DBPath:        absPath(getOr("DB_PATH", "~/mpv-relay/data/relay.db")),
 		LogPath:       absPath(getOr("LOG_PATH", "~/mpv-relay/logs/relay.log")),
+		StreamerURL:   getOr("STREAMER_URL", "http://localhost:9000"),
 	}
 
 	port, err := strconv.Atoi(getOr("MQTT_PORT", "8883"))
@@ -90,6 +96,7 @@ func Load() (*Config, error) {
 	// Ensure directories exist
 	for _, dir := range []string{
 		cfg.MusicCacheDir,
+		cfg.MediaDir,
 		filepath.Dir(cfg.DBPath),
 		filepath.Dir(cfg.LogPath),
 	} {

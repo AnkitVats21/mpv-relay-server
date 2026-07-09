@@ -29,8 +29,10 @@ import (
 	"github.com/ankitm/mpv-relay/internal/mpv"
 	mqtthandler "github.com/ankitm/mpv-relay/internal/mqtt"
 	"github.com/ankitm/mpv-relay/internal/queue"
+	"github.com/ankitm/mpv-relay/internal/resource"
 	"github.com/ankitm/mpv-relay/internal/resolver"
 	"github.com/ankitm/mpv-relay/internal/router"
+	"github.com/ankitm/mpv-relay/internal/streamer"
 	"github.com/ankitm/mpv-relay/internal/ws"
 )
 
@@ -99,14 +101,8 @@ func main() {
 	wsHub = ws.NewHub(rtr.Dispatch)
 	go wsHub.Run()
 
-	// WebSocket HTTP route
-	http.Handle("/ws", wsHub)
-	go func() {
-		log.Info("Starting WebSocket server", "addr", cfg.WSAddr)
-		if err := http.ListenAndServe(cfg.WSAddr, nil); err != nil {
-			log.Error("WebSocket server HTTP listen failed", "err", err)
-		}
-	}()
+	mux := http.NewServeMux()
+	mux.Handle("/ws", wsHub)
 
 	// Initialize MQTT client
 	mqttMsgHandler := func(topic string, payload []byte) {
@@ -129,6 +125,18 @@ func main() {
 		}
 	}
 	mqttH = mqtthandler.New(cfg, mqttMsgHandler)
+
+	// Initialize Streamer & Resource Manager
+	rm := resource.New()
+	streamerInst := streamer.New(database, rm, mqttH, cfg.MediaDir)
+	streamerInst.RegisterHTTPHandler(mux)
+
+	go func() {
+		log.Info("Starting HTTP & Streamer server", "addr", cfg.WSAddr)
+		if err := http.ListenAndServe(cfg.WSAddr, mux); err != nil {
+			log.Error("HTTP server listen failed", "err", err)
+		}
+	}()
 
 	// ── Connect ───────────────────────────────────────────────────────────────
 	if err := mqttH.Connect(); err != nil {
