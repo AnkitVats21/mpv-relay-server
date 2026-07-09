@@ -11,8 +11,9 @@ import (
 )
 
 func main() {
-	serverFlag := flag.String("server", "", "Base URL of the relay HTTP stream server")
-	timeoutFlag := flag.Int("timeout", 120, "Max total scenario runtime in seconds")
+	serverFlag  := flag.String("server",   "",    "Base URL of the relay HTTP stream server")
+	timeoutFlag := flag.Int("timeout",     120,   "Max total scenario runtime in seconds")
+	dumpWAVFlag := flag.String("dump-wav", "",    "Save the first received PCM stream as a WAV file for manual verification.\nExample: --dump-wav /tmp/test  →  /tmp/test_<scenario>.wav\nFormat: 32000 Hz, mono, 16-bit signed LE (matches ESP32 DMA layout).")
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] <scenario>\n\n", os.Args[0])
@@ -71,7 +72,11 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	log.Info("Starting ESP32 Simulator Test Agent", "server", serverOverride, "timeout", *timeoutFlag)
+	log.Info("Starting ESP32 Simulator Test Agent",
+		"server", serverOverride,
+		"timeout", *timeoutFlag,
+		"dump_wav", *dumpWAVFlag,
+	)
 
 	// Connect to MQTT
 	mqttClient, err := NewSimMQTT(cfg)
@@ -93,19 +98,18 @@ func main() {
 			"disconnect_reconnect",
 			"cache_miss_live",
 		}
-
 		for _, sc := range scenariosToRun {
-			res := RunScenario(sc, mqttClient, player, serverOverride, *timeoutFlag, log)
+			res := RunScenario(sc, mqttClient, player, serverOverride, *timeoutFlag, *dumpWAVFlag, log)
 			results = append(results, res)
-			// Wait a brief moment between scenarios to let server queue/player clear
+			// Brief pause between scenarios to let the server queue drain
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		res := RunScenario(scenario, mqttClient, player, serverOverride, *timeoutFlag, log)
+		res := RunScenario(scenario, mqttClient, player, serverOverride, *timeoutFlag, *dumpWAVFlag, log)
 		results = append(results, res)
 	}
 
-	// Print summary table
+	// ── Summary table ────────────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Printf("%-25s %-8s %-10s %-9s %-9s\n", "SCENARIO", "PASSED", "DURATION", "MIN_BPS", "MAX_BPS")
 	allPassed := true
@@ -122,6 +126,20 @@ func main() {
 		fmt.Printf("%-25s %-8s %-10s %-9.0f %-9.0f%s\n",
 			res.Name, passedStr, fmt.Sprintf("%.1fs", res.Duration.Seconds()),
 			res.MinThroughputBps, res.MaxThroughputBps, errSuffix)
+
+		// PCM health warnings (indented under the scenario row)
+		for _, w := range res.HealthWarnings() {
+			fmt.Printf("  ⚠️  PCM %s\n", w)
+		}
+	}
+
+	// WAV playback hint
+	if *dumpWAVFlag != "" {
+		fmt.Println()
+		fmt.Println("── WAV verification ──────────────────────────────────────────")
+		fmt.Printf("   aplay -r 32000 -c 1 -f S16_LE <file>.wav\n")
+		fmt.Printf("   # Or open in Audacity / VLC\n")
+		fmt.Println("──────────────────────────────────────────────────────────────")
 	}
 
 	if !allPassed {

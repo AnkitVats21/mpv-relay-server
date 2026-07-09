@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 const (
@@ -74,9 +75,10 @@ func BuildYtDlpStream(ctx context.Context, videoID string) *exec.Cmd {
 		videoID,
 	}
 	cmd := exec.CommandContext(ctx, ytdlpBin, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
-			return cmd.Process.Signal(os.Kill)
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		return nil
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -23,6 +24,21 @@ type ScenarioResult struct {
 	Duration         time.Duration
 	MaxThroughputBps float64
 	MinThroughputBps float64
+
+	// PCM audio health (populated after stream ends)
+	PCM PCMStats
+}
+
+func (r ScenarioResult) HealthWarnings() []string {
+	var w []string
+	if r.PCM.SilenceWarning {
+		ms := float64(r.PCM.MaxSilenceRun) / float64(DefaultPCMConfig.SampleRate) * 1000
+		w = append(w, fmt.Sprintf("SILENCE: longest run %d samples (%.0f ms)", r.PCM.MaxSilenceRun, ms))
+	}
+	if r.PCM.ClippingWarning {
+		w = append(w, fmt.Sprintf("CLIPPING: %.1f%% of samples at ±32767", r.PCM.ClippingPercent))
+	}
+	return w
 }
 
 func getSteps(name string) []Step {
@@ -51,12 +67,13 @@ func getSteps(name string) []Step {
 	case "disconnect_reconnect":
 		return []Step{
 			{WaitMs: 0, Action: "play", Payload: map[string]any{"query": "Daft Punk Get Lucky"}},
-			{WaitMs: 5000, Action: "disconnect"},
-			{WaitMs: 2000, Action: "reconnect"},
+			{WaitMs: 5000, Action: "disconnect"}, // drop HTTP connection mid-stream
+			{WaitMs: 2000, Action: "reconnect"},  // re-GET /stream with same token
 			{WaitMs: 8000, Action: "stop"},
 		}
 	case "cache_miss_live":
 		return []Step{
+			// Force live yt-dlp pipe by using a fresh URL not on disk
 			{WaitMs: 0, Action: "play", Payload: map[string]any{"query": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}},
 			{WaitMs: 20000, Action: "stop"},
 		}
@@ -82,11 +99,31 @@ func resolveStreamURL(rawURL string, serverOverride string) (string, error) {
 	return u.String(), nil
 }
 
-func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverride string, timeoutSec int, log *slog.Logger) ScenarioResult {
+// wavPathForScenario returns the WAV dump path for a given scenario name.
+// Returns "" if dumpWAVBase is empty (no dump requested).
+// For "all" runs each scenario gets its own file: base_<name>.wav
+func wavPathForScenario(dumpWAVBase, scenarioName string) string {
+	if dumpWAVBase == "" {
+		return ""
+	}
+	// Strip .wav suffix so we can append _<name>.wav
+	base := strings.TrimSuffix(dumpWAVBase, ".wav")
+	return fmt.Sprintf("%s_%s.wav", base, scenarioName)
+}
+
+// RunScenario executes all steps of the named scenario sequentially.
+// dumpWAVBase: if non-empty, the first stream of this scenario is saved as
+//   <dumpWAVBase>_<scenarioName>.wav so you can play it back with aplay/VLC.
+func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverride string, timeoutSec int, dumpWAVBase string, log *slog.Logger) ScenarioResult {
 	startTime := time.Now()
 	log.Info("Running scenario", "name", name)
 
-	// Clean up player state
+	dumpPath := wavPathForScenario(dumpWAVBase, name)
+	if dumpPath != "" {
+		log.Info("WAV dump enabled", "path", dumpPath)
+	}
+
+	// Clean up player state from any previous scenario
 	player.Disconnect()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
@@ -96,6 +133,8 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 	var minThroughput float64 = -1
 	var maxThroughput float64 = 0
 	var failureError string
+	var latestPCMStats PCMStats
+	wavUsed := false // only dump WAV for the first stream connection
 
 	failScenario := func(reason string) {
 		mu.Lock()
@@ -106,7 +145,14 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		cancel()
 	}
 
-	// 1. Start background START_STREAM listener
+	mergePCM := func(s PCMStats) {
+		mu.Lock()
+		latestPCMStats = s
+		mu.Unlock()
+	}
+
+	// 1. Background START_STREAM listener: auto-connects the HTTP stream
+	//    whenever the server sends a START_STREAM message.
 	go func() {
 		for {
 			waitCtx, waitCancel := context.WithCancel(ctx)
@@ -124,9 +170,36 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 			// Disconnect any active stream first
 			player.Disconnect()
 
-			log.Info("Auto-connecting to stream URL", "url", resolvedURL)
+			// Determine whether to dump WAV for this connection
+			mu.Lock()
+			var connectDump string
+			if !wavUsed && dumpPath != "" {
+				connectDump = dumpPath
+				wavUsed = true
+			}
+			mu.Unlock()
+
+			log.Info("Auto-connecting to stream URL", "url", resolvedURL, "dump_wav", connectDump)
 			go func() {
-				if err := player.Connect(ctx, resolvedURL); err != nil {
+				stats, err := player.Connect(ctx, resolvedURL, connectDump, DefaultPCMConfig)
+				mergePCM(stats)
+				if connectDump != "" && stats.TotalSamples > 0 {
+					log.Info("WAV dump complete",
+						"path", connectDump,
+						"samples", stats.TotalSamples,
+						"clipping_pct", fmt.Sprintf("%.2f%%", stats.ClippingPercent),
+						"max_silence_run", stats.MaxSilenceRun,
+					)
+					if stats.SilenceWarning {
+						log.Warn("PCM health: long silence detected",
+							"max_silence_samples", stats.MaxSilenceRun)
+					}
+					if stats.ClippingWarning {
+						log.Warn("PCM health: high clipping rate",
+							"clipping_pct", fmt.Sprintf("%.1f%%", stats.ClippingPercent))
+					}
+				}
+				if err != nil {
 					if ctx.Err() == nil && !strings.Contains(err.Error(), "context canceled") {
 						log.Error("Player connection failed", "err", err)
 						if strings.Contains(err.Error(), "403") {
@@ -138,7 +211,7 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		}
 	}()
 
-	// 2. Start background throughput checker
+	// 2. Background throughput checker: logs every 2s, fails after 3 consecutive low samples.
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -165,8 +238,8 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 					if throughput < 64000 {
 						consecutiveLow++
 						log.Warn("Low throughput sample", "throughput", throughput, "consecutive", consecutiveLow)
-						if consecutiveLow > 3 {
-							log.Error("Throughput below threshold for more than 3 consecutive samples", "consecutive", consecutiveLow)
+						if consecutiveLow >= 3 {
+							log.Error("Throughput below threshold for 3+ consecutive samples", "consecutive", consecutiveLow)
 							failScenario("throughput below threshold")
 							return
 						}
@@ -178,18 +251,22 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		}
 	}()
 
-	// Get steps
+	// 3. Execute scenario steps.
 	steps := getSteps(name)
 	for idx, step := range steps {
-		// Sleep wait time or exit if cancelled
 		if step.WaitMs > 0 {
 			select {
 			case <-ctx.Done():
 				mu.Lock()
 				errStr := failureError
+				pcm := latestPCMStats
+				minT, maxT := minThroughput, maxThroughput
 				mu.Unlock()
 				if errStr == "" {
 					errStr = "scenario cancelled or timed out"
+				}
+				if minT < 0 {
+					minT = 0
 				}
 				return ScenarioResult{
 					Name:             name,
@@ -197,14 +274,14 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 					Passed:           false,
 					Error:            errStr,
 					Duration:         time.Since(startTime),
-					MinThroughputBps: minThroughput,
-					MaxThroughputBps: maxThroughput,
+					MinThroughputBps: minT,
+					MaxThroughputBps: maxT,
+					PCM:              pcm,
 				}
 			case <-time.After(time.Duration(step.WaitMs) * time.Millisecond):
 			}
 		}
 
-		// Run action
 		log.Info("Executing step", "action", step.Action, "payload", step.Payload)
 		switch step.Action {
 		case "play":
@@ -213,7 +290,7 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 				failScenario("mqtt publish failed: " + err.Error())
 				break
 			}
-			// Wait for START_STREAM
+			// Wait for the server to respond with START_STREAM (auto-connect goroutine handles HTTP)
 			waitCtx, waitCancel := context.WithTimeout(ctx, 15*time.Second)
 			_, _, _, _, err = mqtt.WaitForStartStream(waitCtx)
 			waitCancel()
@@ -263,7 +340,17 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 
 		case "reconnect":
 			go func() {
-				if err := player.Reconnect(ctx); err != nil {
+				mu.Lock()
+				var reconnectDump string
+				if !wavUsed && dumpPath != "" {
+					reconnectDump = dumpPath
+					wavUsed = true
+				}
+				mu.Unlock()
+
+				stats, err := player.Reconnect(ctx, reconnectDump, DefaultPCMConfig)
+				mergePCM(stats)
+				if err != nil {
 					if ctx.Err() == nil && !strings.Contains(err.Error(), "context canceled") {
 						log.Error("Player reconnect failed", "err", err)
 						if strings.Contains(err.Error(), "403") {
@@ -290,6 +377,7 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 	passed := errStr == ""
 	minT := minThroughput
 	maxT := maxThroughput
+	pcm := latestPCMStats
 	mu.Unlock()
 
 	if minT < 0 {
@@ -304,5 +392,6 @@ func RunScenario(name string, mqtt *SimMQTT, player *StreamPlayer, serverOverrid
 		Duration:         time.Since(startTime),
 		MinThroughputBps: minT,
 		MaxThroughputBps: maxT,
+		PCM:              pcm,
 	}
 }
