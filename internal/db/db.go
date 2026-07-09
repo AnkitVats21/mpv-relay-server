@@ -40,6 +40,33 @@ CREATE TABLE IF NOT EXISTS play_history (
     title     TEXT,
     played_at REAL NOT NULL
 );
+
+-- LRU-tracked media files on disk
+CREATE TABLE IF NOT EXISTS media_cache (
+    video_id         TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    file_path        TEXT NOT NULL,
+    file_size_bytes  INTEGER NOT NULL,
+    duration_seconds INTEGER DEFAULT 0,
+    last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_lru ON media_cache(last_accessed_at ASC);
+
+-- Persistent playback queue with state machine
+CREATE TABLE IF NOT EXISTS playback_queue (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'PENDING',
+    -- Valid: 'PENDING', 'PREFETCHING', 'READY', 'PLAYING', 'COMPLETED', 'FAILED'
+    source     TEXT,           -- 'gemini_voice' | 'web' | 'phone_cast'
+    added_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    started_at DATETIME        -- set when ESP32 pulls first bytes
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_status ON playback_queue(status, id ASC);
 `
 
 // SongRow mirrors the song_cache table.
