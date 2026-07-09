@@ -38,7 +38,7 @@ func findYtDlp() string {
 // and outputs raw PCM to stdout.
 // seekSeconds > 0 inserts -ss <seekSeconds> before -i for pause/resume.
 func BuildFFmpegFromFile(ctx context.Context, filePath string, seekSeconds float64) *exec.Cmd {
-	args := []string{"-nofind_stream_info"}
+	var args []string
 	if seekSeconds > 0 {
 		seekStr := strconv.FormatFloat(seekSeconds, 'f', -1, 64)
 		args = append(args, "-ss", seekStr)
@@ -67,7 +67,8 @@ func BuildFFmpegFromFile(ctx context.Context, filePath string, seekSeconds float
 func BuildYtDlpStream(ctx context.Context, videoID string) *exec.Cmd {
 	ytdlpBin := findYtDlp()
 	args := []string{
-		"-f", "bestaudio",
+		"--js-runtimes", "node",
+		"-f", "bestaudio/best",
 		"-o", "-",
 		"--",
 		videoID,
@@ -85,7 +86,6 @@ func BuildYtDlpStream(ctx context.Context, videoID string) *exec.Cmd {
 // BuildFFmpegFromStdin returns an exec.Cmd reading from stdin (connected to yt-dlp).
 func BuildFFmpegFromStdin(ctx context.Context) *exec.Cmd {
 	args := []string{
-		"-nofind_stream_info",
 		"-i", "-",
 		"-f", Format,
 		"-acodec", Codec,

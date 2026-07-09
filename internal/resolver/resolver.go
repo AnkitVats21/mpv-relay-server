@@ -213,6 +213,7 @@ func (r *Resolver) StartBackgroundDownload(track *ResolvedTrack, onComplete func
 
 func (r *Resolver) searchYtDlp(query string) (*ResolvedTrack, error) {
 	args := []string{
+		"--js-runtimes", "node",
 		"--no-playlist", "-j", "--skip-download",
 		"ytsearch1:" + query,
 	}
@@ -553,7 +554,8 @@ func (r *Resolver) downloadWorker(track *ResolvedTrack, target string, onComplet
 
 	r.log.Info("BG download starting", "title", track.Title, "target", target)
 	args := []string{
-		"--no-playlist", "-f", "bestaudio",
+		"--js-runtimes", "node",
+		"--no-playlist", "-f", "bestaudio/best",
 		"-o", target,
 		track.WebpageURL,
 	}

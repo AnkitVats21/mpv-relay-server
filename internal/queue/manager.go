@@ -896,7 +896,7 @@ func (m *Manager) startPrefetchWorker() {
 		m.log.Info("Prefetch worker: downloading track", "videoID", entry.VideoID, "title", entry.Title)
 		outputPath := filepath.Join(m.cfg.MediaDir, entry.VideoID+".%(ext)s")
 
-		cmd := exec.Command("nice", "-n", "10", m.resolver.YtDlpBin(), "-f", "bestaudio", "-o", outputPath, "--", entry.VideoID)
+		cmd := exec.Command("nice", "-n", "10", m.resolver.YtDlpBin(), "--js-runtimes", "node", "-f", "bestaudio/best", "-o", outputPath, "--", entry.VideoID)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 

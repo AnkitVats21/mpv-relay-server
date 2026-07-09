@@ -2,8 +2,10 @@
 # Uses pure-Go SQLite (modernc.org/sqlite) so cross-compilation does not require CGO.
 
 BINARY_NAME=mpv-relay
+SIM_BINARY_NAME=esp-sim
 BUILD_DIR=build
 CMD_PATH=./cmd/relay
+SIM_CMD_PATH=./cmd/esp-sim
 
 # Go build flags
 LDFLAGS=-ldflags="-w -s"
@@ -18,7 +20,7 @@ all: build
 
 help:
 	@echo "Available commands:"
-	@echo "  make build               Build binary for the current host platform"
+	@echo "  make build               Build binaries for the current host platform"
 	@echo "  make run                 Run the application locally"
 	@echo "  make clean               Remove build artifacts"
 	@echo "  make build-all           Cross-compile binaries for all supported platforms"
@@ -33,7 +35,8 @@ build:
 	@echo "Building for host platform..."
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
-	@echo "Built successfully: $(BUILD_DIR)/$(BINARY_NAME)"
+	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BUILD_DIR)/$(SIM_BINARY_NAME) $(SIM_CMD_PATH)
+	@echo "Built successfully: $(BUILD_DIR)/$(BINARY_NAME) and $(BUILD_DIR)/$(SIM_BINARY_NAME)"
 
 run:
 	CGO_ENABLED=$(CGO_ENABLED) go run $(CMD_PATH)
