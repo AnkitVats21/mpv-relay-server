@@ -94,7 +94,10 @@ func main() {
 		}
 	}
 
-	qMgr := queue.New(mpvClient, res, database, cfg, publishFn)
+	// Initialize Resource Manager early
+	rm := resource.New()
+
+	qMgr := queue.New(mpvClient, res, database, cfg, publishFn, rm)
 	rtr := router.New(qMgr, mpvClient, database, publishFn, publishMqttRawFn)
 
 	// Initialize WebSocket hub
@@ -126,10 +129,10 @@ func main() {
 	}
 	mqttH = mqtthandler.New(cfg, mqttMsgHandler)
 
-	// Initialize Streamer & Resource Manager
-	rm := resource.New()
+	// Initialize Streamer
 	streamerInst := streamer.New(database, rm, mqttH, cfg.MediaDir)
 	streamerInst.RegisterHTTPHandler(mux)
+	qMgr.SetStreamer(streamerInst)
 
 	go func() {
 		log.Info("Starting HTTP & Streamer server", "addr", cfg.WSAddr)

@@ -1,26 +1,29 @@
 // Package queue manages the play queue, autoplay pool, and background caching.
-//
-// Caching strategy (mirrors Python):
-//   - MPV stream-record saves audio while playing to MUSIC_CACHE_DIR/<id>.mkv
-//   - On end-file(eof): mark complete in DB → next play uses local file
-//   - On end-file(stop/error): delete incomplete recording
 package queue
 
 import (
-	"encoding/json"
+	"bytes"
+	"context"
 	"log/slog"
 	"math/rand"
-	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ankitm/mpv-relay/internal/config"
 	"github.com/ankitm/mpv-relay/internal/db"
 	"github.com/ankitm/mpv-relay/internal/mpv"
 	"github.com/ankitm/mpv-relay/internal/resolver"
+	"github.com/ankitm/mpv-relay/internal/resource"
 )
+
+// StreamerInterface avoids circular imports between streamer and queue.
+type StreamerInterface interface {
+	StartStream(videoID, title string) error
+}
 
 // QueueItem is what we expose over MQTT for queue listings.
 type QueueItem struct {
@@ -43,14 +46,15 @@ type Manager struct {
 	publish  func(map[string]any) // mqtt publish_fn
 	log      *slog.Logger
 
+	streamer StreamerInterface
+	rm       *resource.ResourceManager
+
 	mu             sync.Mutex
-	queue          []*resolver.ResolvedTrack
 	current        *resolver.ResolvedTrack
 	recordPath     string
 	autoplayOn     bool
 	autoplayPool   []*resolver.ResolvedTrack
 	nextAutoplay   *resolver.ResolvedTrack
-	ignoreNextEOF             bool // set during track transitions to swallow spurious end-file
 	historyStack              []string
 	isNavBack                 bool
 	wasPlayingBeforeAssistant bool
@@ -61,8 +65,8 @@ type Manager struct {
 	dlBusy  bool
 }
 
-// New creates a Manager and registers the MPV end-file event handler.
-func New(m *mpv.Client, res *resolver.Resolver, database *db.DB, cfg *config.Config, publish func(map[string]any)) *Manager {
+// New creates a Manager.
+func New(m *mpv.Client, res *resolver.Resolver, database *db.DB, cfg *config.Config, publish func(map[string]any), rm *resource.ResourceManager) *Manager {
 	mgr := &Manager{
 		mpv:        m,
 		resolver:   res,
@@ -71,9 +75,17 @@ func New(m *mpv.Client, res *resolver.Resolver, database *db.DB, cfg *config.Con
 		publish:    publish,
 		autoplayOn: true,
 		log:        slog.Default().With("pkg", "queue"),
+		rm:         rm,
 	}
-	m.OnEvent("end-file", mgr.onEOF)
+	go mgr.startPrefetchWorker()
 	return mgr
+}
+
+// SetStreamer sets the streamer dependency.
+func (m *Manager) SetStreamer(s StreamerInterface) {
+	m.mu.Lock()
+	m.streamer = s
+	m.mu.Unlock()
 }
 
 // ── Autoplay ──────────────────────────────────────────────────────────────────
@@ -95,49 +107,357 @@ func (m *Manager) IsAutoplayEnabled() bool {
 	return m.autoplayOn
 }
 
+// ── State Machine Transitions ──────────────────────────────────────────────────
+
+func (m *Manager) advanceQueue() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, err := m.db.GetNextPending()
+	if err != nil {
+		m.log.Error("advanceQueue: failed to get next pending track", "err", err)
+		return
+	}
+	if entry == nil {
+		m.log.Info("advanceQueue: no more pending tracks in queue")
+		if m.autoplayOn && len(m.autoplayPool) > 0 {
+			next := m.autoplayPool[0]
+			m.autoplayPool = m.autoplayPool[1:]
+			if len(m.autoplayPool) > 0 {
+				m.nextAutoplay = m.autoplayPool[0]
+			} else {
+				m.nextAutoplay = nil
+			}
+			m.log.Info("advanceQueue: auto-advancing via AUTOPLAY", "title", next.Title)
+			m.mu.Unlock()
+			go m.playTrackFromAutoplay(next)
+			m.mu.Lock()
+		} else {
+			m.log.Info("advanceQueue: entering idle state")
+			m.current = nil
+			m.mu.Unlock()
+			m.PublishStatus()
+			m.mu.Lock()
+		}
+		return
+	}
+
+	m.log.Info("advanceQueue: playing next track from queue", "videoID", entry.VideoID, "title", entry.Title)
+	m.mu.Unlock()
+	go m.playQueueEntry(entry)
+	m.mu.Lock()
+}
+
+func (m *Manager) markPlaying(id int64) {
+	_ = m.db.SetQueueStatus(id, "PLAYING")
+	_ = m.db.SetQueueStarted(id)
+}
+
+func (m *Manager) markCompleted(id int64) {
+	_ = m.db.SetQueueStatus(id, "COMPLETED")
+	m.advanceQueue()
+}
+
+func (m *Manager) markFailed(id int64) {
+	_ = m.db.SetQueueStatus(id, "FAILED")
+	if m.publish != nil {
+		m.publish(map[string]any{
+			"type":    "error",
+			"message": "Playback failed",
+		})
+	}
+	m.advanceQueue()
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 // PlayNow resolves a query and starts playing immediately (clears queue + pool).
 func (m *Manager) PlayNow(query string, download bool) *resolver.ResolvedTrack {
+	track, err := m.resolver.Resolve(query)
+	if err != nil || track == nil {
+		m.log.Error("PlayNow: could not resolve query", "query", query, "err", err)
+		return nil
+	}
+	if !download {
+		track.SkipDownload = true
+	}
+	if track.Duration > 1200 {
+		m.log.Warn("PlayNow: Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
+		if m.publish != nil {
+			m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
+		}
+		return nil
+	}
+
 	m.mu.Lock()
-	m.queue = nil
 	m.autoplayPool = nil
 	m.nextAutoplay = nil
 	m.wasPlayingBeforeAssistant = false
+	if m.current != nil && !m.isNavBack {
+		m.historyStack = append(m.historyStack, m.current.Query)
+	}
+	m.isNavBack = false
 	m.mu.Unlock()
-	return m.resolveAndPlay(query, download)
+
+	// Cancel any current PLAYING track
+	playing, err := m.db.GetPlayingEntry()
+	if err == nil && playing != nil {
+		m.log.Info("PlayNow: cancelling current playing track", "id", playing.ID, "title", playing.Title)
+		_ = m.db.SetQueueStatus(playing.ID, "COMPLETED")
+	}
+
+	// Insert row into playback_queue with status PENDING
+	entry := db.QueueEntry{
+		VideoID: track.VideoID,
+		Title:   track.Title,
+		Status:  "PENDING",
+		Source:  "web",
+		AddedAt: time.Now(),
+	}
+	id, err := m.db.EnqueueTrack(entry)
+	if err != nil {
+		m.log.Error("PlayNow: failed to enqueue track", "err", err)
+		return nil
+	}
+	entry.ID = id
+
+	// If cached on disk -> update status to READY
+	cached := false
+	if track.FilePath != "" && fileExists(track.FilePath) {
+		cached = true
+	} else {
+		if row, err := m.db.LookupMediaCache(track.VideoID); err == nil && row != nil && row.FilePath != "" {
+			if fileExists(row.FilePath) {
+				cached = true
+				track.FilePath = row.FilePath
+			}
+		}
+	}
+	if cached {
+		_ = m.db.SetQueueStatus(entry.ID, "READY")
+		entry.Status = "READY"
+	}
+
+	// Call m.streamer.StartStream
+	err = m.streamer.StartStream(track.VideoID, track.Title)
+	if err != nil {
+		m.log.Error("PlayNow: streamer.StartStream failed", "err", err)
+		_ = m.db.SetQueueStatus(entry.ID, "FAILED")
+		if m.publish != nil {
+			m.publish(map[string]any{
+				"type":    "error",
+				"message": "Playback failed to start",
+			})
+		}
+		return nil
+	}
+
+	m.markPlaying(entry.ID)
+
+	m.mu.Lock()
+	m.current = track
+	m.mu.Unlock()
+
+	_ = m.db.IncrementPlayCount(track.Query)
+	_ = m.db.SavePlayHistory(track.Query, track.Title)
+
+	if m.publish != nil {
+		m.publish(map[string]any{
+			"type":           "playing",
+			"title":          track.Title,
+			"uploader":       track.Uploader,
+			"duration":       track.Duration,
+			"query":          track.Query,
+			"thumbnail_path": track.ThumbnailPath,
+			"thumbnail_url":  track.ThumbnailURL,
+			"related_videos": track.RelatedVideos,
+		})
+	}
+	m.PublishStatus()
+
+	go m.monitorStreamCompletion(entry.ID)
+	go m.enrichRecommendations(track)
+
+	return track
 }
 
 // QueueAdd appends a query to the end of the queue.
 func (m *Manager) QueueAdd(query string, download bool) {
-	go m.resolveAndEnqueue(query, false, download)
+	go func() {
+		if m.publish != nil {
+			m.publish(map[string]any{"type": "resolving", "query": query})
+		}
+
+		track, err := m.resolver.Resolve(query)
+		if err != nil || track == nil {
+			m.log.Error("QueueAdd: could not resolve query", "query", query)
+			if m.publish != nil {
+				m.publish(map[string]any{"type": "error", "message": "Could not resolve query: " + query})
+			}
+			return
+		}
+		if !download {
+			track.SkipDownload = true
+		}
+		if track.Duration > 1200 {
+			m.log.Warn("QueueAdd: Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
+			if m.publish != nil {
+				m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
+			}
+			return
+		}
+
+		entry := db.QueueEntry{
+			VideoID: track.VideoID,
+			Title:   track.Title,
+			Status:  "PENDING",
+			Source:  "web",
+			AddedAt: time.Now(),
+		}
+
+		cached := false
+		if track.FilePath != "" && fileExists(track.FilePath) {
+			cached = true
+		} else {
+			if row, err := m.db.LookupMediaCache(track.VideoID); err == nil && row != nil && row.FilePath != "" {
+				if fileExists(row.FilePath) {
+					cached = true
+					track.FilePath = row.FilePath
+				}
+			}
+		}
+		if cached {
+			entry.Status = "READY"
+		}
+
+		_, err = m.db.EnqueueTrack(entry)
+		if err != nil {
+			m.log.Error("QueueAdd: failed to enqueue track", "err", err)
+			return
+		}
+
+		if m.publish != nil {
+			m.publish(map[string]any{
+				"type":            "queued",
+				"title":           track.Title,
+				"query":           query,
+				"video_id":        track.VideoID,
+				"insert_at_front": false,
+			})
+		}
+		m.PublishQueueInfo()
+
+		playing, err := m.db.GetPlayingEntry()
+		if err == nil && playing == nil {
+			m.log.Info("QueueAdd: nothing playing, advancing queue immediately")
+			m.advanceQueue()
+		}
+	}()
 }
 
 // PlayNext prepends a query to the front of the queue.
 func (m *Manager) PlayNext(query string, download bool) {
-	go m.resolveAndEnqueue(query, true, download)
+	go func() {
+		if m.publish != nil {
+			m.publish(map[string]any{"type": "resolving", "query": query})
+		}
+
+		track, err := m.resolver.Resolve(query)
+		if err != nil || track == nil {
+			m.log.Error("PlayNext: could not resolve query", "query", query)
+			if m.publish != nil {
+				m.publish(map[string]any{"type": "error", "message": "Could not resolve query: " + query})
+			}
+			return
+		}
+		if !download {
+			track.SkipDownload = true
+		}
+		if track.Duration > 1200 {
+			m.log.Warn("PlayNext: Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
+			if m.publish != nil {
+				m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
+			}
+			return
+		}
+
+		entry := db.QueueEntry{
+			VideoID: track.VideoID,
+			Title:   track.Title,
+			Status:  "PENDING",
+			Source:  "web",
+			AddedAt: time.Now(),
+		}
+
+		cached := false
+		if track.FilePath != "" && fileExists(track.FilePath) {
+			cached = true
+		} else {
+			if row, err := m.db.LookupMediaCache(track.VideoID); err == nil && row != nil && row.FilePath != "" {
+				if fileExists(row.FilePath) {
+					cached = true
+					track.FilePath = row.FilePath
+				}
+			}
+		}
+		if cached {
+			entry.Status = "READY"
+		}
+
+		_, err = m.db.EnqueueTrackAtFront(entry)
+		if err != nil {
+			m.log.Error("PlayNext: failed to enqueue track at front", "err", err)
+			return
+		}
+
+		if m.publish != nil {
+			m.publish(map[string]any{
+				"type":            "queued",
+				"title":           track.Title,
+				"query":           query,
+				"video_id":        track.VideoID,
+				"insert_at_front": true,
+			})
+		}
+		m.PublishQueueInfo()
+
+		playing, err := m.db.GetPlayingEntry()
+		if err == nil && playing == nil {
+			m.log.Info("PlayNext: nothing playing, advancing queue immediately")
+			m.advanceQueue()
+		}
+	}()
 }
 
-// Skip stops the current track (EOF handler advances to next).
+// Skip stops the current track (forces completion and advances).
 func (m *Manager) Skip() {
 	m.mu.Lock()
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
-	_ = m.mpv.Stop()
+
+	playing, err := m.db.GetPlayingEntry()
+	if err == nil && playing != nil {
+		m.log.Info("Skip: marking playing entry as COMPLETED", "id", playing.ID, "title", playing.Title)
+		_ = m.db.SetQueueStatus(playing.ID, "COMPLETED")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, release := m.rm.AcquireLiveStream(ctx)
+	release()
+	cancel()
+
+	m.advanceQueue()
 }
 
 // ClearQueue removes all pending items.
 func (m *Manager) ClearQueue() {
-	m.mu.Lock()
-	m.queue = nil
-	m.mu.Unlock()
+	_ = m.db.ClearQueue()
 	m.log.Info("Queue cleared")
 }
 
-// StopAll clears the queue, autoplay pool, history, and stops MPV.
+// StopAll clears the queue, autoplay pool, history, and stops active streams.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
-	m.queue = nil
 	m.current = nil
 	m.autoplayPool = nil
 	m.nextAutoplay = nil
@@ -146,7 +466,19 @@ func (m *Manager) StopAll() {
 	m.wasPlayingBeforeAssistant = false
 	m.assistantActive = false
 	m.mu.Unlock()
-	_ = m.mpv.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, release := m.rm.AcquireLiveStream(ctx)
+	release()
+	cancel()
+
+	playing, err := m.db.GetPlayingEntry()
+	if err == nil && playing != nil {
+		_ = m.db.SetQueueStatus(playing.ID, "COMPLETED")
+	}
+
+	_ = m.db.ClearQueue()
+
 	m.log.Info("StopAll: queue, autoplay pool, and history cleared")
 	m.PublishStatus()
 }
@@ -154,59 +486,135 @@ func (m *Manager) StopAll() {
 // Shuffle randomises the pending queue.
 func (m *Manager) Shuffle() {
 	m.mu.Lock()
-	rand.Shuffle(len(m.queue), func(i, j int) { m.queue[i], m.queue[j] = m.queue[j], m.queue[i] })
-	m.mu.Unlock()
-	m.log.Info("Queue shuffled", "len", len(m.queue))
+	defer m.mu.Unlock()
+
+	entries, err := m.db.ListQueue()
+	if err != nil {
+		m.log.Error("Shuffle: failed to list queue", "err", err)
+		return
+	}
+
+	var shuffleList []db.QueueEntry
+	for _, entry := range entries {
+		if entry.Status == "PENDING" || entry.Status == "READY" {
+			shuffleList = append(shuffleList, entry)
+		}
+	}
+
+	if len(shuffleList) <= 1 {
+		m.log.Info("Shuffle: not enough tracks to shuffle")
+		return
+	}
+
+	rand.Shuffle(len(shuffleList), func(i, j int) {
+		shuffleList[i], shuffleList[j] = shuffleList[j], shuffleList[i]
+	})
+
+	_ = m.db.ClearQueue()
+
+	for _, entry := range shuffleList {
+		_, _ = m.db.EnqueueTrack(entry)
+	}
+
+	m.log.Info("Shuffle: queue shuffled in DB", "count", len(shuffleList))
 }
 
 // ListQueue returns a snapshot of the pending queue items.
 func (m *Manager) ListQueue() []QueueItem {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	items := make([]QueueItem, 0, len(m.queue))
-	for i, t := range m.queue {
+	entries, err := m.db.ListQueue()
+	if err != nil {
+		m.log.Error("ListQueue: failed to list queue from DB", "err", err)
+		return nil
+	}
+	items := make([]QueueItem, 0, len(entries))
+	for i, entry := range entries {
+		var uploader, thumbURL string
+		var duration int
+		var cached bool
+		if song, err := m.db.LookupVideoID(entry.VideoID); err == nil && song != nil {
+			uploader = song.Uploader
+			duration = song.Duration
+			thumbURL = song.ThumbnailURL
+			cached = song.FilePath != "" && fileExists(song.FilePath)
+		}
 		items = append(items, QueueItem{
 			Position:     i + 1,
-			VideoID:      t.VideoID,
-			Title:        t.Title,
-			Uploader:     t.Uploader,
-			Duration:     t.Duration,
-			ThumbnailURL: t.ThumbnailURL,
-			Cached:       t.FilePath != "" && fileExists(t.FilePath),
+			VideoID:      entry.VideoID,
+			Title:        entry.Title,
+			Uploader:     uploader,
+			Duration:     duration,
+			ThumbnailURL: thumbURL,
+			Cached:       cached,
+			Source:       entry.Source,
 		})
 	}
 	return items
 }
 
-// CurrentTrack returns the currently playing track (may attempt recovery).
+// CurrentTrack returns the currently playing track.
 func (m *Manager) CurrentTrack() *resolver.ResolvedTrack {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.current == nil {
-		m.recoverCurrentTrack()
-	}
 	return m.current
 }
 
 // Previous plays the previously played track from the history stack.
 func (m *Manager) Previous() {
 	m.mu.Lock()
-	if len(m.historyStack) == 0 {
-		m.mu.Unlock()
-		m.log.Info("No previous track in history stack")
-		return
-	}
-	if m.current != nil {
-		m.queue = append([]*resolver.ResolvedTrack{m.current}, m.queue...)
-	}
-	prevQuery := m.historyStack[len(m.historyStack)-1]
-	m.historyStack = m.historyStack[:len(m.historyStack)-1]
-	m.isNavBack = true
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
 
-	m.log.Info("Playing previous track", "query", prevQuery)
-	go m.resolveAndPlay(prevQuery, true)
+	history, err := m.db.GetHistory(2)
+	if err != nil || len(history) < 2 {
+		m.log.Info("Previous: no previous track in history")
+		return
+	}
+	prev := history[1]
+
+	playing, err := m.db.GetPlayingEntry()
+	if err == nil && playing != nil {
+		_ = m.db.SetQueueStatus(playing.ID, "COMPLETED")
+		
+		cached := false
+		if song, err := m.db.LookupVideoID(playing.VideoID); err == nil && song != nil {
+			if song.FilePath != "" && fileExists(song.FilePath) {
+				cached = true
+			}
+		}
+		status := "PENDING"
+		if cached {
+			status = "READY"
+		}
+		
+		reEnqueueCurrent := db.QueueEntry{
+			VideoID: playing.VideoID,
+			Title:   playing.Title,
+			Status:  status,
+			Source:  playing.Source,
+			AddedAt: time.Now(),
+		}
+		_, _ = m.db.EnqueueTrackAtFront(reEnqueueCurrent)
+	}
+
+	prevEntry := db.QueueEntry{
+		VideoID: prev.VideoID,
+		Title:   prev.Title,
+		Status:  "PENDING",
+		Source:  "web",
+		AddedAt: time.Now(),
+	}
+	_, err = m.db.EnqueueTrackAtFront(prevEntry)
+	if err != nil {
+		m.log.Error("Previous: failed to enqueue previous track at front", "err", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, release := m.rm.AcquireLiveStream(ctx)
+	release()
+	cancel()
+
+	m.advanceQueue()
 }
 
 // PublishPlaybackState broadcasts only the playback metrics.
@@ -252,7 +660,6 @@ func (m *Manager) PublishTrackInfo() {
 		payload["thumbnail_path"] = current.ThumbnailPath
 		payload["thumbnail_url"] = current.ThumbnailURL
 
-		// Annotate related videos with cached status
 		related := make([]map[string]any, 0, len(current.RelatedVideos))
 		for _, v := range current.RelatedVideos {
 			isCached := false
@@ -291,11 +698,13 @@ func (m *Manager) PublishQueueInfo() {
 	}()
 
 	m.mu.Lock()
-	qLen := len(m.queue)
 	nextAP := m.nextAutoplay
 	poolSnap := append([]*resolver.ResolvedTrack(nil), m.autoplayPool...)
 	autoplayOn := m.autoplayOn
 	m.mu.Unlock()
+
+	qItems := m.ListQueue()
+	qLen := len(qItems)
 
 	payload := map[string]any{
 		"type":         "status",
@@ -313,8 +722,6 @@ func (m *Manager) PublishQueueInfo() {
 		payload["next_autoplay"] = nil
 	}
 
-	// Build unified up_next list: manual queue first, then autoplay pool
-	qItems := m.ListQueue()
 	qIDs := map[string]bool{}
 	upNext := make([]map[string]any, 0, len(qItems)+len(poolSnap))
 	for _, qi := range qItems {
@@ -351,22 +758,19 @@ func (m *Manager) PublishQueueInfo() {
 	m.publish(payload)
 }
 
-// PublishStatus broadcasts all status updates separately to restore client state.
+// PublishStatus broadcasts all status updates.
 func (m *Manager) PublishStatus() {
 	m.PublishPlaybackState()
 	m.PublishTrackInfo()
 	m.PublishQueueInfo()
 }
 
-// ── Download queue ────────────────────────────────────────────────────────────
+// ── Download queue (Legacy Sequential Handler) ──────────────────────────────
 
-// AddToDownloadQueue resolves and enqueues a video_id for background download.
 func (m *Manager) AddToDownloadQueue(videoID string) {
 	m.log.Info("Download request received", "videoID", videoID)
 	go func() {
 		var track *resolver.ResolvedTrack
-
-		// Check DB first
 		row, err := m.db.LookupVideoID(videoID)
 		if err == nil && row != nil {
 			track = dbRowToTrack(row)
@@ -457,193 +861,137 @@ func (m *Manager) SearchSongs(query string) {
 	}()
 }
 
+// ── Background Prefetch Worker ───────────────────────────────────────────────
+
+func (m *Manager) startPrefetchWorker() {
+	m.log.Info("Starting background prefetch worker")
+	for {
+		entry, err := m.db.GetNextForPrefetch()
+		if err != nil {
+			m.log.Error("Prefetch worker: failed to get next pending track", "err", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if entry == nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		if err := m.db.SetQueueStatus(entry.ID, "PREFETCHING"); err != nil {
+			m.log.Error("Prefetch worker: failed to set status to PREFETCHING", "id", entry.ID, "err", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		release, err := m.rm.AcquirePrefetch(ctx)
+		cancel()
+		if err != nil {
+			m.log.Info("Prefetch worker: resource manager busy or live stream active, skipping prefetch for now", "videoID", entry.VideoID)
+			_ = m.db.SetQueueStatus(entry.ID, "PENDING")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		m.log.Info("Prefetch worker: downloading track", "videoID", entry.VideoID, "title", entry.Title)
+		outputPath := filepath.Join(m.cfg.MediaDir, entry.VideoID+".%(ext)s")
+
+		cmd := exec.Command("nice", "-n", "10", m.resolver.YtDlpBin(), "-f", "bestaudio", "-o", outputPath, "--", entry.VideoID)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+
+		err = cmd.Run()
+		if err != nil {
+			m.log.Error("Prefetch worker: download failed", "videoID", entry.VideoID, "err", err, "stderr", stderr.String())
+			_ = m.db.SetQueueStatus(entry.ID, "FAILED")
+			if m.publish != nil {
+				m.publish(map[string]any{
+					"type":     "PREFETCH_FAILED",
+					"cmd":      "PREFETCH_FAILED",
+					"video_id": entry.VideoID,
+					"error":    err.Error(),
+				})
+			}
+			release()
+			continue
+		}
+
+		filePath := findDownloadedFile(m.cfg.MediaDir, entry.VideoID)
+		if filePath == "" {
+			m.log.Error("Prefetch worker: download completed but file not found on disk", "videoID", entry.VideoID)
+			_ = m.db.SetQueueStatus(entry.ID, "FAILED")
+			if m.publish != nil {
+				m.publish(map[string]any{
+					"type":     "PREFETCH_FAILED",
+					"cmd":      "PREFETCH_FAILED",
+					"video_id": entry.VideoID,
+					"error":    "Downloaded file not found",
+				})
+			}
+			release()
+			continue
+		}
+
+		var size int64
+		if fi, err := os.Stat(filePath); err == nil {
+			size = fi.Size()
+		}
+
+		duration := 0
+		if song, err := m.db.LookupVideoID(entry.VideoID); err == nil && song != nil {
+			duration = song.Duration
+		}
+
+		mediaEntry := db.MediaCacheEntry{
+			VideoID:         entry.VideoID,
+			Title:           entry.Title,
+			FilePath:        filePath,
+			FileSizeBytes:   size,
+			DurationSeconds: duration,
+			LastAccessedAt:  time.Now(),
+			CreatedAt:       time.Now(),
+		}
+		if err := m.db.UpsertMediaCache(mediaEntry); err != nil {
+			m.log.Warn("Prefetch worker: failed to upsert media cache", "videoID", entry.VideoID, "err", err)
+		}
+
+		if err := m.db.MarkVideoDownloaded(entry.VideoID, filePath); err != nil {
+			m.log.Warn("Prefetch worker: failed to update song cache file_path", "videoID", entry.VideoID, "err", err)
+		}
+
+		m.log.Info("Prefetch worker: download completed successfully", "videoID", entry.VideoID, "path", filePath)
+		_ = m.db.SetQueueStatus(entry.ID, "READY")
+		m.PublishQueueInfo()
+
+		release()
+	}
+}
+
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-func (m *Manager) resolveAndPlay(query string, download bool) *resolver.ResolvedTrack {
-	track, err := m.resolver.Resolve(query)
-	if err != nil || track == nil {
-		m.log.Error("Could not resolve query", "query", query, "err", err)
-		return nil
-	}
-	if !download {
-		track.SkipDownload = true
-	}
-	if track.Duration > 1200 {
-		m.log.Warn("Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
-		if m.publish != nil {
-			m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
-		}
-		return nil
-	}
-	m.playTrack(track)
-	return track
-}
-
-func (m *Manager) resolveAndEnqueue(query string, front bool, download bool) {
-	if m.publish != nil {
-		m.publish(map[string]any{"type": "resolving", "query": query})
-	}
-
-	track, err := m.resolver.Resolve(query)
-	if err != nil || track == nil {
-		m.log.Error("Could not resolve queue query", "query", query)
-		if m.publish != nil {
-			m.publish(map[string]any{"type": "error", "message": "Could not resolve query: " + query})
-		}
-		return
-	}
-	if !download {
-		track.SkipDownload = true
-	}
-
-	if track.Duration > 1200 {
-		m.log.Warn("Ignoring track exceeding 20 minutes", "title", track.Title, "duration", track.Duration)
-		if m.publish != nil {
-			m.publish(map[string]any{"type": "error", "message": "Tracks longer than 20 minutes are not allowed."})
-		}
+func (m *Manager) playQueueEntry(entry *db.QueueEntry) {
+	err := m.streamer.StartStream(entry.VideoID, entry.Title)
+	if err != nil {
+		m.log.Error("playQueueEntry: failed to start stream", "videoID", entry.VideoID, "err", err)
+		m.markFailed(entry.ID)
 		return
 	}
 
-	m.mu.Lock()
-	idle := m.current == nil || m.mpv.IsIdle()
-	m.mu.Unlock()
+	m.markPlaying(entry.ID)
 
-	if idle {
-		m.log.Info("Nothing playing — playing immediately", "title", track.Title)
-		m.playTrack(track)
-		return
-	}
-
-	m.mu.Lock()
-	m.removeFormAutoplayPool(track.VideoID)
-	if front {
-		m.queue = append([]*resolver.ResolvedTrack{track}, m.queue...)
-		m.log.Info("Prepended (Play Next)", "title", track.Title)
+	var track *resolver.ResolvedTrack
+	if song, err := m.db.LookupVideoID(entry.VideoID); err == nil && song != nil {
+		track = dbRowToTrack(song)
 	} else {
-		m.queue = append(m.queue, track)
-		m.log.Info("Appended to queue", "title", track.Title, "pos", len(m.queue))
-	}
-	if len(m.autoplayPool) > 0 {
-		m.nextAutoplay = m.autoplayPool[0]
-	} else {
-		m.nextAutoplay = nil
-	}
-	m.mu.Unlock()
-
-	if m.publish != nil {
-		m.publish(map[string]any{
-			"type":           "queued",
-			"title":          track.Title,
-			"query":          query,
-			"video_id":       track.VideoID,
-			"insert_at_front": front,
-		})
-	}
-	m.PublishQueueInfo()
-}
-
-func (m *Manager) playNext() {
-	var next *resolver.ResolvedTrack
-	isAutoplay := false
-
-	m.mu.Lock()
-	if len(m.queue) > 0 {
-		next = m.queue[0]
-		m.queue = m.queue[1:]
-	} else if m.autoplayOn && len(m.autoplayPool) > 0 {
-		next = m.autoplayPool[0]
-		m.autoplayPool = m.autoplayPool[1:]
-		if len(m.autoplayPool) > 0 {
-			m.nextAutoplay = m.autoplayPool[0]
-		} else {
-			m.nextAutoplay = nil
+		track = &resolver.ResolvedTrack{
+			VideoID:    entry.VideoID,
+			Title:      entry.Title,
+			WebpageURL: "https://www.youtube.com/watch?v=" + entry.VideoID,
 		}
-		isAutoplay = true
-	} else {
-		m.current = nil
-		m.recordPath = ""
-		m.nextAutoplay = nil
-		m.mu.Unlock()
-		m.log.Info("Queue exhausted — entering idle state")
-		return
-	}
-	m.mu.Unlock()
-
-	if isAutoplay {
-		m.log.Info("Auto-advancing via AUTOPLAY", "title", next.Title)
-		// If the track is minimal (no RelatedVideos), resolve it now so
-		// prefetchWorker can build recommendations. Should be a fast DB
-		// cache hit since enrichNextAutoplay ran in the background.
-		if next.RelatedVideos == nil {
-			if full, err := m.resolver.Resolve(next.WebpageURL); err == nil && full != nil {
-				next = full
-			}
-		}
-	} else {
-		m.log.Info("Auto-advancing via QUEUE", "title", next.Title)
-	}
-
-	if next != nil && next.Duration > 1200 {
-		m.log.Warn("Skipping popped track exceeding 20 minutes", "title", next.Title, "duration", next.Duration)
-		m.playNext() // Try the next track
-		return
-	}
-
-	go m.playTrack(next)
-}
-
-func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
-	m.mu.Lock()
-	m.removeFormAutoplayPool(track.VideoID)
-	if len(m.autoplayPool) > 0 {
-		m.nextAutoplay = m.autoplayPool[0]
-	} else {
-		m.nextAutoplay = nil
-	}
-	if m.current != nil || !m.mpv.IsIdle() {
-		// A track is playing/loading; the loadfile will cause MPV to fire
-		// end-file(stop) AND potentially a synthesised end-file(eof) via the
-		// idle-active edge. Suppress both until we're settled.
-		m.ignoreNextEOF = true
-	}
-	if m.current != nil && !m.isNavBack {
-		m.historyStack = append(m.historyStack, m.current.Query)
-	}
-	m.isNavBack = false
-	active := m.assistantActive
-	if active {
-		m.wasPlayingBeforeAssistant = true
-	} else {
-		m.wasPlayingBeforeAssistant = false
-	}
-	m.mu.Unlock()
-
-	var recordPath string
-	if track.FilePath != "" && fileExists(track.FilePath) {
-		m.log.Info("Playing LOCAL file", "path", track.FilePath)
-		m.mpv.Loadfile(track.FilePath, "")
-	} else if m.resolver.IsDownloading(track.VideoID) {
-		m.log.Info("Streaming directly (BG download in progress)", "title", track.Title)
-		m.mpv.Loadfile(track.WebpageURL, "")
-	} else if track.SkipDownload {
-		m.log.Info("Streaming directly (SkipDownload is true)", "title", track.Title)
-		m.mpv.Loadfile(track.WebpageURL, "")
-	} else {
-		recordPath = filepath.Join(m.cfg.MusicCacheDir, track.VideoID+".mkv")
-		m.log.Info("Streaming with stream-record", "title", track.Title, "record", recordPath)
-		m.mpv.Loadfile(track.WebpageURL, recordPath)
-	}
-
-	if !active {
-		_ = m.mpv.Resume()
-	} else {
-		m.log.Info("playTrack: loading track but leaving paused since assistant is active")
-		_ = m.mpv.Pause()
 	}
 
 	m.mu.Lock()
 	m.current = track
-	m.recordPath = recordPath
 	m.mu.Unlock()
 
 	_ = m.db.IncrementPlayCount(track.Query)
@@ -662,40 +1010,67 @@ func (m *Manager) playTrack(track *resolver.ResolvedTrack) {
 		})
 	}
 	m.PublishStatus()
-	go m.prefetchWorker(track)
+
+	go m.monitorStreamCompletion(entry.ID)
+	go m.enrichRecommendations(track)
 }
 
-func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
-	// 1. Pre-cache the next manually queued track (if any).
-	m.mu.Lock()
-	var nextQueued *resolver.ResolvedTrack
-	if len(m.queue) > 0 {
-		nextQueued = m.queue[0]
+func (m *Manager) playTrackFromAutoplay(track *resolver.ResolvedTrack) {
+	entry := db.QueueEntry{
+		VideoID: track.VideoID,
+		Title:   track.Title,
+		Status:  "PENDING",
+		Source:  "autoplay",
+		AddedAt: time.Now(),
 	}
-	m.mu.Unlock()
+	id, err := m.db.EnqueueTrack(entry)
+	if err != nil {
+		m.log.Error("playTrackFromAutoplay: failed to enqueue autoplay track", "err", err)
+		return
+	}
+	entry.ID = id
 
-	if nextQueued != nil {
-		if !nextQueued.SkipDownload {
-			m.log.Info("Prefetching next queued track", "title", nextQueued.Title)
-			m.resolver.StartBackgroundDownload(nextQueued, func(success bool) {
-				m.log.Info("Pre-cache done for queued track", "title", nextQueued.Title, "success", success)
-				m.PublishQueueInfo()
-			})
-		} else {
-			m.log.Info("Skipping prefetch for queued track because SkipDownload is true", "title", nextQueued.Title)
+	m.playQueueEntry(&entry)
+}
+
+func (m *Manager) monitorStreamCompletion(entryID int64) {
+	for i := 0; i < 20; i++ {
+		if m.rm.IsLiveStreamActive() {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	for {
+		time.Sleep(500 * time.Millisecond)
+		if !m.rm.IsLiveStreamActive() {
+			break
 		}
 	}
 
-	// 2. Build dedup sets from existing pool + play history + manual queue.
+	entry, err := m.db.GetQueueEntry(entryID)
+	if err == nil && entry != nil && entry.Status == "PLAYING" {
+		m.log.Info("monitorStreamCompletion: stream ended naturally, marking COMPLETED", "id", entryID)
+		m.markCompleted(entryID)
+	}
+}
+
+func (m *Manager) enrichRecommendations(track *resolver.ResolvedTrack) {
 	m.mu.Lock()
 	poolIDs := map[string]bool{}
 	for _, t := range m.autoplayPool {
 		poolIDs[t.VideoID] = true
 	}
-	for _, t := range m.queue {
-		poolIDs[t.VideoID] = true
-	}
 	m.mu.Unlock()
+
+	entries, err := m.db.ListQueue()
+	if err == nil {
+		m.mu.Lock()
+		for _, entry := range entries {
+			poolIDs[entry.VideoID] = true
+		}
+		m.mu.Unlock()
+	}
 
 	history, _ := m.db.GetHistory(10)
 	playedIDs := map[string]bool{track.VideoID: true}
@@ -705,7 +1080,6 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 		}
 	}
 
-	// 3. Filter to only genuinely new candidates.
 	var newCandidates []db.RelatedVideo
 	for _, v := range track.RelatedVideos {
 		if v.ID == "" || poolIDs[v.ID] || playedIDs[v.ID] {
@@ -723,8 +1097,6 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 		return
 	}
 
-	// 4. Add new candidates as MINIMAL tracks — zero yt-dlp calls.
-	//    Cap pool at 50 total; skip additions once full.
 	const maxPoolSize = 50
 	m.log.Info("Pooling recommendations (lazy, no yt-dlp)", "count", len(newCandidates))
 	m.mu.Lock()
@@ -753,17 +1125,12 @@ func (m *Manager) prefetchWorker(track *resolver.ResolvedTrack) {
 	}
 	m.mu.Unlock()
 
-	// 5. Whenever nextAutoplay was just set for the first time, pre-resolve
-	//    and pre-download that track in the background (1 yt-dlp call max).
 	if newNextAutoplay {
 		go m.enrichNextAutoplay()
 	}
 	m.PublishQueueInfo()
 }
 
-// enrichNextAutoplay resolves the first unresolved (minimal) entry in the
-// autoplay pool via a single yt-dlp call, then starts a background audio
-// download for it. All other pool entries remain minimal until they play.
 func (m *Manager) enrichNextAutoplay() {
 	m.mu.Lock()
 	if len(m.autoplayPool) == 0 {
@@ -774,7 +1141,7 @@ func (m *Manager) enrichNextAutoplay() {
 	m.mu.Unlock()
 
 	if next.RelatedVideos != nil {
-		return // already fully resolved
+		return
 	}
 
 	full, err := m.resolver.Resolve(next.WebpageURL)
@@ -804,7 +1171,6 @@ func (m *Manager) enrichNextAutoplay() {
 		return
 	}
 
-	// Replace the minimal entry with the fully resolved track.
 	m.mu.Lock()
 	if len(m.autoplayPool) > 0 && m.autoplayPool[0].VideoID == next.VideoID {
 		m.autoplayPool[0] = full
@@ -822,108 +1188,26 @@ func (m *Manager) enrichNextAutoplay() {
 	m.PublishQueueInfo()
 }
 
-// onEOF handles MPV end-file events.
 func (m *Manager) onEOF(event map[string]any) {
-	reason, _ := event["reason"].(string)
-	if reason == "" {
-		reason = "unknown"
-	}
-	m.log.Info("MPV end-file", "reason", reason)
-
-	m.mu.Lock()
-	if m.ignoreNextEOF {
-		m.ignoreNextEOF = false
-		m.mu.Unlock()
-		m.log.Info("Ignoring spurious end-file during track transition", "reason", reason)
-		return
-	}
-	track := m.current
-	recPath := m.recordPath
-	m.mu.Unlock()
-
-	if reason == "eof" {
-		if track != nil && recPath != "" && fileExists(recPath) {
-			size := fileSizeMB(recPath)
-			m.log.Info("Recording complete", "path", recPath, "size_mb", size)
-			_ = m.db.MarkFileDownloaded(track.Query, recPath)
-		}
-		m.playNext()
-	} else {
-		// Incomplete recording — delete partial file
-		if recPath != "" && fileExists(recPath) {
-			if err := os.Remove(recPath); err != nil {
-				m.log.Warn("Could not delete partial recording", "path", recPath, "err", err)
-			} else {
-				m.log.Info("Deleted incomplete recording", "reason", reason, "path", recPath)
-			}
-		}
-		if reason == "stop" {
-			m.playNext()
-		} else {
-			m.mu.Lock()
-			m.current = nil
-			m.recordPath = ""
-			m.mu.Unlock()
-		}
-	}
-}
-
-// recoverCurrentTrack attempts to reconstruct m.current from MPV's active path/URL.
-// Must be called with m.mu held.
-func (m *Manager) recoverCurrentTrack() {
-	if m.mpv.IsIdle() {
-		return
-	}
-	path := m.mpv.GetPath()
-	if path == "" {
-		return
-	}
-
-	var videoID string
-	if strings.Contains(path, "youtube.com") || strings.Contains(path, "youtu.be") {
-		parsed, err := url.Parse(path)
-		if err == nil {
-			if strings.Contains(parsed.Host, "youtube.com") {
-				videoID = parsed.Query().Get("v")
-			} else if strings.Contains(parsed.Host, "youtu.be") {
-				videoID = strings.TrimPrefix(parsed.Path, "/")
-			}
-		}
-	} else {
-		base := filepath.Base(path)
-		if strings.HasSuffix(base, ".mkv") {
-			videoID = strings.TrimSuffix(base, ".mkv")
-		} else if strings.HasSuffix(base, ".jpg") {
-			videoID = strings.TrimSuffix(base, ".jpg")
-		}
-	}
-
-	if videoID == "" {
-		return
-	}
-
-	row, err := m.db.LookupVideoID(videoID)
-	if err != nil || row == nil {
-		return
-	}
-	track := dbRowToTrack(row)
-	m.current = track
-	if rec := m.mpv.GetStreamRecord(); rec != "" {
-		m.recordPath = rec
-	}
-	m.log.Info("Recovered active track from MPV path", "path", path, "title", track.Title)
+	// Left as no-op or fallback since now driven by StartStream + HTTP streamer context completion.
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func (m *Manager) removeFormAutoplayPool(videoID string) {
-	var clean []*resolver.ResolvedTrack
-	for _, t := range m.autoplayPool {
-		if t.VideoID != videoID {
-			clean = append(clean, t)
+func findDownloadedFile(mediaDir, videoID string) string {
+	files, err := os.ReadDir(mediaDir)
+	if err != nil {
+		return ""
+	}
+	for _, f := range files {
+		if !f.IsDir() && strings.HasPrefix(f.Name(), videoID+".") {
+			ext := filepath.Ext(f.Name())
+			if ext != ".part" && ext != ".ytdl" && ext != ".tmp" {
+				return filepath.Join(mediaDir, f.Name())
+			}
 		}
 	}
-	m.autoplayPool = clean
+	return ""
 }
 
 func dbRowToTrack(row *db.SongRow) *resolver.ResolvedTrack {
@@ -946,23 +1230,7 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func fileSizeMB(path string) float64 {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return float64(fi.Size()) / (1024 * 1024)
-}
-
-// jsonMarshal is a convenience used in status payloads.
-func jsonMarshal(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
-}
-
-var _ = jsonMarshal // suppress unused warning
-
-// Pause pauses playback and resets assistant pause state.
+// Pause pauses playback.
 func (m *Manager) Pause() {
 	m.mu.Lock()
 	m.wasPlayingBeforeAssistant = false
@@ -970,7 +1238,7 @@ func (m *Manager) Pause() {
 	_ = m.mpv.Pause()
 }
 
-// Resume resumes playback and resets assistant pause state.
+// Resume resumes playback.
 func (m *Manager) Resume() {
 	m.mu.Lock()
 	if m.assistantActive {
@@ -985,7 +1253,6 @@ func (m *Manager) Resume() {
 }
 
 // AssistantPause handles pausing for wake word/assistant conversation start.
-// It remembers if the player was currently playing so we can resume it later.
 func (m *Manager) AssistantPause() {
 	status := m.mpv.GetStatus()
 
@@ -994,8 +1261,6 @@ func (m *Manager) AssistantPause() {
 	if status.State == "playing" {
 		m.wasPlayingBeforeAssistant = true
 	}
-	// If the player is already paused, we keep the existing wasPlayingBeforeAssistant state.
-	// This prevents back-to-back assistant_pause commands from resetting it to false.
 	wasPlaying := m.wasPlayingBeforeAssistant
 	m.mu.Unlock()
 
@@ -1008,7 +1273,6 @@ func (m *Manager) AssistantPause() {
 }
 
 // AssistantPlay handles resuming after assistant conversation ends.
-// It resumes only if the player was playing before the assistant paused it.
 func (m *Manager) AssistantPlay() {
 	m.mu.Lock()
 	m.assistantActive = false

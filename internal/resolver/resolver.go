@@ -57,6 +57,11 @@ func New(database *db.DB, cfg *config.Config) *Resolver {
 	}
 }
 
+// YtDlpBin returns the path to the resolved yt-dlp binary.
+func (r *Resolver) YtDlpBin() string {
+	return r.ytdlpBin
+}
+
 // findYtDlp looks for the yt-dlp binary in this order:
 //  1. YTDLP_BIN env var
 //  2. Sibling `bin/yt-dlp` of the running executable

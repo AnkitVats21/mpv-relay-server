@@ -117,7 +117,7 @@ type DB struct {
 
 // Open opens (or creates) the database at path and runs schema migrations.
 func Open(path string) (*DB, error) {
-	sqldb, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	sqldb, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("db open: %w", err)
 	}

@@ -319,3 +319,104 @@ func (d *DB) ClearQueue() error {
 	_, err := d.db.Exec(q)
 	return err
 }
+
+// GetPlayingEntry returns the currently playing queue entry, if any.
+func (d *DB) GetPlayingEntry() (*QueueEntry, error) {
+	const q = `
+	SELECT id, video_id, title, status, source, added_at, started_at
+	FROM playback_queue
+	WHERE status = 'PLAYING'
+	LIMIT 1
+	`
+	var entry QueueEntry
+	var addedAt time.Time
+	var startedAt *time.Time
+	err := d.db.QueryRow(q).Scan(
+		&entry.ID,
+		&entry.VideoID,
+		&entry.Title,
+		&entry.Status,
+		&entry.Source,
+		&addedAt,
+		&startedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	entry.AddedAt = addedAt
+	entry.StartedAt = startedAt
+	return &entry, nil
+}
+
+// GetQueueEntry returns a specific queue entry by id.
+func (d *DB) GetQueueEntry(id int64) (*QueueEntry, error) {
+	const q = `
+	SELECT id, video_id, title, status, source, added_at, started_at
+	FROM playback_queue
+	WHERE id = ?
+	`
+	var entry QueueEntry
+	var addedAt time.Time
+	var startedAt *time.Time
+	err := d.db.QueryRow(q, id).Scan(
+		&entry.ID,
+		&entry.VideoID,
+		&entry.Title,
+		&entry.Status,
+		&entry.Source,
+		&addedAt,
+		&startedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	entry.AddedAt = addedAt
+	entry.StartedAt = startedAt
+	return &entry, nil
+}
+
+// MarkVideoDownloaded updates the file path of any song in song_cache with matching video_id.
+func (d *DB) MarkVideoDownloaded(videoID, filePath string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec("UPDATE song_cache SET file_path = ? WHERE video_id = ?", filePath, videoID)
+	return err
+}
+
+// EnqueueTrackAtFront inserts a track at the front of the queue by assigning it an ID smaller than any existing ID.
+func (d *DB) EnqueueTrackAtFront(track QueueEntry) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var minID int64
+	err := d.db.QueryRow("SELECT COALESCE(MIN(id), 0) FROM playback_queue").Scan(&minID)
+	if err != nil {
+		return 0, err
+	}
+	newID := minID - 1
+
+	status := track.Status
+	if status == "" {
+		status = "PENDING"
+	}
+	addedAtStr := toDBTime(track.AddedAt)
+	startedAtStr := toDBTimePtr(track.StartedAt)
+
+	const q = `
+	INSERT INTO playback_queue (id, video_id, title, status, source, added_at, started_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = d.db.Exec(q, newID, track.VideoID, track.Title, status, track.Source, addedAtStr, startedAtStr)
+	if err != nil {
+		return 0, err
+	}
+	return newID, nil
+}
+
+
