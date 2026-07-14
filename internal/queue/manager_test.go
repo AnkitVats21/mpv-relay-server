@@ -21,7 +21,7 @@ type mockStreamer struct {
 	onStart    func()
 }
 
-func (ms *mockStreamer) StartStream(videoID, title string) error {
+func (ms *mockStreamer) StartStream(videoID, title string, fromChunk ...uint32) error {
 	ms.mu.Lock()
 	ms.startCalls = append(ms.startCalls, videoID)
 	err := ms.startErr
@@ -35,6 +35,13 @@ func (ms *mockStreamer) StartStream(videoID, title string) error {
 		go onStart()
 	}
 	return nil
+}
+
+func (ms *mockStreamer) CancelStream()            {}
+func (ms *mockStreamer) SavePause(_ uint32)        {}
+func (ms *mockStreamer) ResumeStream() error       { return nil }
+func (ms *mockStreamer) GetSessionInfo() (string, int64, time.Duration) {
+	return "", 0, 0
 }
 
 func waitCondition(timeout time.Duration, cond func() bool) bool {
@@ -163,13 +170,7 @@ func TestQueueManager(t *testing.T) {
 	t.Run("PlayNow triggers streaming and sets PLAYING state", func(t *testing.T) {
 		streamer.mu.Lock()
 		streamer.startCalls = nil
-		streamer.onStart = func() {
-			_, release := rm.AcquireLiveStream(context.Background())
-			go func() {
-				time.Sleep(50 * time.Millisecond)
-				release()
-			}()
-		}
+		streamer.onStart = nil
 		streamer.mu.Unlock()
 
 		track := mgr.PlayNow("song1", false)
@@ -187,12 +188,10 @@ func TestQueueManager(t *testing.T) {
 			t.Fatalf("expected playing track to be %s, got %+v", vids[0], playing)
 		}
 
-		// Wait for monitorStreamCompletion to detect disconnection and mark COMPLETED
-		ok = waitCondition(2*time.Second, func() bool {
-			playing, _ = d.GetPlayingEntry()
-			return playing == nil
-		})
-		if !ok {
+		// Call PlaybackFinished to simulate ESP completion and mark COMPLETED
+		mgr.PlaybackFinished()
+		playing, _ = d.GetPlayingEntry()
+		if playing != nil {
 			t.Fatalf("expected playing track to be completed (nil), got %+v", playing)
 		}
 	})
@@ -200,13 +199,7 @@ func TestQueueManager(t *testing.T) {
 	t.Run("QueueAdd enqueues tracks and handles play transition", func(t *testing.T) {
 		streamer.mu.Lock()
 		streamer.startCalls = nil
-		streamer.onStart = func() {
-			_, release := rm.AcquireLiveStream(context.Background())
-			go func() {
-				time.Sleep(50 * time.Millisecond)
-				release()
-			}()
-		}
+		streamer.onStart = nil
 		streamer.mu.Unlock()
 
 		mgr.QueueAdd("song2", false)
@@ -232,7 +225,10 @@ func TestQueueManager(t *testing.T) {
 			t.Fatalf("expected queued items, got 0")
 		}
 
-		// Wait for vids[1] to finish, which should trigger vids[2] to play
+		// Trigger PlaybackFinished to transition from song2 to song3
+		mgr.PlaybackFinished()
+
+		// Wait for vids[2] to play
 		ok = waitCondition(2*time.Second, func() bool {
 			playing, _ := d.GetPlayingEntry()
 			return playing != nil && playing.VideoID == vids[2]

@@ -28,6 +28,7 @@ var allowedCmds = map[string]bool{
 	"device_config_get": true, "device_config_set": true,
 	"gemini_config_get": true, "gemini_config_set": true,
 	"stream_status": true, "prefetch_status": true, "clear_cache": true,
+	"playback_finished": true, "playback_complete": true,
 }
 
 // Router dispatches MQTT commands to queue/streamer/db handlers.
@@ -95,7 +96,7 @@ func (r *Router) run(cmd string, p map[string]any) {
 	case "queue":
 		r.cmdQueue(p)
 	case "pause":
-		r.cmdPause()
+		r.cmdPause(p)
 	case "resume":
 		r.cmdResume()
 	case "assistant_pause":
@@ -106,6 +107,8 @@ func (r *Router) run(cmd string, p map[string]any) {
 		r.cmdStop()
 	case "next":
 		r.cmdNext()
+	case "playback_finished", "playback_complete":
+		r.cmdPlaybackFinished()
 	case "previous":
 		r.cmdPrevious()
 	case "seek":
@@ -190,8 +193,18 @@ func (r *Router) cmdQueue(p map[string]any) {
 	r.q.QueueAdd(query, download)
 }
 
-func (r *Router) cmdPause() {
-	r.q.Pause()
+func (r *Router) cmdPause(p map[string]any) {
+	// ESP32 sends last_chunk so the server can resume from the exact position.
+	var lastChunk uint32
+	if v, ok := p["last_chunk"]; ok {
+		switch n := v.(type) {
+		case float64:
+			lastChunk = uint32(n)
+		case int:
+			lastChunk = uint32(n)
+		}
+	}
+	r.q.Pause(lastChunk)
 	r.publish(map[string]any{"type": "state", "state": "paused"})
 }
 
@@ -218,6 +231,10 @@ func (r *Router) cmdNext() {
 	r.publish(map[string]any{"type": "state", "state": "skipping"})
 }
 
+func (r *Router) cmdPlaybackFinished() {
+	r.q.PlaybackFinished()
+}
+
 func (r *Router) cmdPrevious() {
 	r.q.Previous()
 }
@@ -227,11 +244,18 @@ func (r *Router) cmdSeek(p map[string]any) {
 }
 
 func (r *Router) cmdVolume(p map[string]any) {
-	r.publish(map[string]any{"type": "error", "message": "not supported in stream mode"})
+	// Volume is an on-device operation — forward as a device_cmd for the ESP32 to handle.
+	val, ok := p["value"]
+	if !ok {
+		r.publish(map[string]any{"type": "error", "message": "'volume' requires a 'value' field"})
+		return
+	}
+	r.publish(map[string]any{"type": "device_cmd", "cmd": "volume", "value": val})
 }
 
 func (r *Router) cmdMute() {
-	r.publish(map[string]any{"type": "error", "message": "not supported in stream mode"})
+	// Mute is an on-device operation — forward as a device_cmd for the ESP32 to handle.
+	r.publish(map[string]any{"type": "device_cmd", "cmd": "mute"})
 }
 
 func (r *Router) cmdShuffle() {

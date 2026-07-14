@@ -19,6 +19,20 @@ const (
 // BytesPerSec = 32000 * 2 * 1 = 64000  (used for seek byte→time conversion)
 const BytesPerSec = 64_000
 
+// Chunk-based streaming constants.
+const (
+	// ChunkSize is the fixed number of PCM bytes per chunk (32 KB ≈ 512 ms of audio).
+	ChunkSize = 32 * 1024
+
+	// ChunkDurationMs is the audio duration represented by one full chunk.
+	// ChunkDurationMs = ChunkSize / BytesPerSec * 1000 = 512
+	ChunkDurationMs = ChunkSize * 1000 / BytesPerSec
+
+	// WindowSize is the number of chunks kept in the server-side ring buffer.
+	// WindowSize × ChunkDurationMs = 50 × 512ms = 25.6 seconds of replayable audio.
+	WindowSize = 50
+)
+
 // findYtDlp looks for the yt-dlp binary.
 func findYtDlp() string {
 	if v := os.Getenv("YTDLP_BIN"); v != "" {

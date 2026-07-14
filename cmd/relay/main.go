@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 
@@ -120,7 +121,7 @@ func main() {
 
 	rm := resource.New()
 
-	streamerInst := streamer.New(database, rm, mqttH, cfg.MediaDir)
+	streamerInst := streamer.New(database, rm, mqttH, cfg.MediaDir, cfg.HTTPStreamPort, res.IsDownloading, res.StartBackgroundDownload)
 
 	qMgr := queue.New(res, database, cfg, publishFn, rm)
 	qMgr.SetStreamer(streamerInst)
@@ -146,23 +147,40 @@ func main() {
 		}
 	}()
 
+	// ── Startup recovery ──────────────────────────────────────────────────────
+	// Mark any queue entries left in PLAYING state from a previous crash as FAILED
+	// so advanceQueue() can continue normally on reconnect.
+	qMgr.RecoverFromRestart()
+
 	// ── Connect ───────────────────────────────────────────────────────────────
 	if err := mqttH.Connect(); err != nil {
 		log.Error("MQTT connect failed", "err", err)
 		os.Exit(1)
 	}
 
+	// Start the paused-session expiry goroutine
+	streamerInst.StartExpiryWorker(rootCtx)
+
 	// Mount HTTP stream handler
 	streamMux := http.NewServeMux()
 	streamerInst.RegisterHTTPHandler(streamMux)
 
+	// WriteTimeout = 0: the /stream endpoint is a long-lived connection.
+	// The stream handler manages its own lifecycle via context cancellation.
+	// A short WriteTimeout would kill legitimate long-paused connections.
+	streamServer := &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.HTTPStreamPort),
+		Handler:      streamMux,
+		WriteTimeout: 0,
+		ReadTimeout:  30 * time.Second,
+	}
+
 	// Start HTTP server in goroutine
 	go func() {
-		addr := fmt.Sprintf(":%d", cfg.HTTPStreamPort)
-		log.Info("HTTP stream server listening", "addr", addr)
-		if err := http.ListenAndServe(addr, streamMux); err != nil {
+		log.Info("HTTP stream server listening", "addr", streamServer.Addr)
+		if err := streamServer.ListenAndServe(); err != nil {
 			log.Error("HTTP stream server failed — triggering shutdown", "err", err)
-			cancel() // graceful shutdown; defers in main will close DB and remove PID file
+			cancel()
 		}
 	}()
 

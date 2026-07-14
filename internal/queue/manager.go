@@ -21,7 +21,11 @@ import (
 
 // StreamerInterface avoids circular imports between streamer and queue.
 type StreamerInterface interface {
-	StartStream(videoID, title string) error
+	StartStream(videoID, title string, fromChunk ...uint32) error
+	CancelStream()
+	SavePause(lastChunk uint32)
+	ResumeStream() error
+	GetSessionInfo() (videoID string, bytesSent int64, uptime time.Duration)
 }
 
 // QueueItem is what we expose over MQTT for queue listings.
@@ -272,7 +276,7 @@ func (m *Manager) PlayNow(query string, download bool) *resolver.ResolvedTrack {
 	}
 	m.PublishStatus()
 
-	go m.monitorStreamCompletion(entry.ID)
+	// go m.monitorStreamCompletion(entry.ID)
 	go m.enrichRecommendations(track)
 
 	return track
@@ -446,10 +450,41 @@ func (m *Manager) Skip() {
 	m.advanceQueue()
 }
 
+// PlaybackFinished marks the current track as completed and advances the queue.
+func (m *Manager) PlaybackFinished() {
+	m.mu.Lock()
+	m.wasPlayingBeforeAssistant = false
+	m.mu.Unlock()
+
+	playing, err := m.db.GetPlayingEntry()
+	if err == nil && playing != nil {
+		m.log.Info("PlaybackFinished: marking playing entry as COMPLETED", "id", playing.ID, "title", playing.Title)
+		_ = m.db.SetQueueStatus(playing.ID, "COMPLETED")
+	}
+
+	m.advanceQueue()
+}
+
 // ClearQueue removes all pending items.
 func (m *Manager) ClearQueue() {
 	_ = m.db.ClearQueue()
 	m.log.Info("Queue cleared")
+}
+
+// RecoverFromRestart marks any stale PLAYING queue entry as FAILED.
+// Call this on startup before connecting to MQTT to prevent queue stalls
+// caused by an in-progress stream that was lost during a server crash/restart.
+func (m *Manager) RecoverFromRestart() {
+	playing, err := m.db.GetPlayingEntry()
+	if err != nil {
+		m.log.Warn("RecoverFromRestart: failed to query DB", "err", err)
+		return
+	}
+	if playing != nil {
+		m.log.Warn("RecoverFromRestart: found stale PLAYING entry — marking FAILED",
+			"id", playing.ID, "title", playing.Title)
+		_ = m.db.SetQueueStatus(playing.ID, "FAILED")
+	}
 }
 
 // StopAll clears the queue, autoplay pool, history, and stops active streams.
@@ -1011,7 +1046,7 @@ func (m *Manager) playQueueEntry(entry *db.QueueEntry) {
 	}
 	m.PublishStatus()
 
-	go m.monitorStreamCompletion(entry.ID)
+	// go m.monitorStreamCompletion(entry.ID)
 	go m.enrichRecommendations(track)
 }
 
@@ -1249,27 +1284,48 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// Pause pauses playback.
-func (m *Manager) Pause() {
+// Pause signals the active stream to close and records the exact chunk index
+// at which the user paused. The ESP must include "last_chunk" in the pause
+// MQTT payload; if absent, 0 is used (resume from beginning).
+func (m *Manager) Pause(lastChunk uint32) {
 	m.mu.Lock()
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
+
+	// Save the exact chunk index — no heuristic needed
+	m.streamer.SavePause(lastChunk)
+
+	// Cancel the HTTP producer — ffmpeg / yt-dlp process killed
+	m.streamer.CancelStream()
+
+	m.log.Info("Pause: producer cancelled", "lastChunk", lastChunk)
 }
 
-// Resume resumes playback.
+// Resume resumes playback from a paused session by issuing a new START_STREAM
+// with the saved seek offset.
 func (m *Manager) Resume() {
 	m.mu.Lock()
 	if m.assistantActive {
+		// If assistant is active, note that user wants to resume after it ends
 		m.wasPlayingBeforeAssistant = true
 		m.mu.Unlock()
-		m.log.Info("Resume ignored: assistant is active, but marked to play on assistant end")
+		m.log.Info("Resume: assistant active — will resume on assistant_play")
 		return
 	}
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
+
+	if err := m.streamer.ResumeStream(); err != nil {
+		m.log.Warn("Resume: no paused session or resume failed", "err", err)
+		// Fall back: publish current status so the client knows state
+		m.PublishStatus()
+	}
 }
 
 // AssistantPause handles pausing for wake word/assistant conversation start.
+// Status-only: sets the assistantActive flag for state tracking and UI display.
+// The HTTP stream suspension is handled purely by the ESP32 (vTaskSuspend +
+// TCP back-pressure) — no server-side stream cancellation is performed.
 func (m *Manager) AssistantPause() {
 	isPlaying := m.rm.IsLiveStreamActive()
 
@@ -1278,27 +1334,19 @@ func (m *Manager) AssistantPause() {
 	if isPlaying {
 		m.wasPlayingBeforeAssistant = true
 	}
-	wasPlaying := m.wasPlayingBeforeAssistant
 	m.mu.Unlock()
 
-	if wasPlaying {
-		m.log.Info("AssistantPause: player was playing")
-	} else {
-		m.log.Info("AssistantPause: player was not playing")
-	}
+	m.log.Info("AssistantPause: flagged assistant active", "wasPlaying", isPlaying)
 }
 
 // AssistantPlay handles resuming after assistant conversation ends.
+// Status-only: clears the assistantActive flag. The stream resumes on the ESP32
+// side by the firmware re-enabling the HTTP fill task — no server action needed.
 func (m *Manager) AssistantPlay() {
 	m.mu.Lock()
 	m.assistantActive = false
-	shouldResume := m.wasPlayingBeforeAssistant
 	m.wasPlayingBeforeAssistant = false
 	m.mu.Unlock()
 
-	if shouldResume {
-		m.log.Info("AssistantPlay: player was playing before assistant")
-	} else {
-		m.log.Info("AssistantPlay: player was not playing before assistant")
-	}
+	m.log.Info("AssistantPlay: assistant inactive")
 }

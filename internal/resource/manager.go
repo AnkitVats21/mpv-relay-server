@@ -43,6 +43,31 @@ func (rm *ResourceManager) AcquireLiveStream(ctx context.Context) (context.Conte
 	return streamCtx, releaseFunc
 }
 
+// AcquireLiveStreamCancellable is like AcquireLiveStream but returns the cancel
+// function separately from the gate-release function.
+// This allows the stream context to be cancelled externally (e.g. Pause) without
+// immediately releasing the gate semaphore.
+//
+//	- cancelFn  cancels the stream context (safe to call multiple times)
+//	- releaseFn releases the gate; must be deferred by the caller
+func (rm *ResourceManager) AcquireLiveStreamCancellable(ctx context.Context) (streamCtx context.Context, cancelFn context.CancelFunc, releaseFn func()) {
+	rm.mu.Lock()
+	if rm.activeCancelFunc != nil {
+		rm.activeCancelFunc()
+	}
+	streamCtx, cancelFn = context.WithCancel(ctx)
+	rm.activeCancelFunc = cancelFn
+	rm.mu.Unlock()
+
+	rm.liveStreamGate <- struct{}{}
+
+	releaseFn = func() {
+		cancelFn()
+		<-rm.liveStreamGate
+	}
+	return streamCtx, cancelFn, releaseFn
+}
+
 // AcquirePrefetch blocks until the prefetch gate is free and the live stream
 // gate is not holding a cache-miss slot. Returns a release func.
 // Must respect the passed ctx for cancellation.

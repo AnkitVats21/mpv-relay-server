@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ankitm/mpv-relay/internal/db"
+	"github.com/ankitm/mpv-relay/internal/resolver"
 	"github.com/ankitm/mpv-relay/internal/resource"
 	"github.com/ankitm/mpv-relay/internal/streamer"
 )
@@ -22,6 +23,10 @@ func (m *mockMqttPublisher) Publish(payload map[string]any) {
 	m.mu.Lock()
 	m.messages = append(m.messages, payload)
 	m.mu.Unlock()
+}
+
+func (m *mockMqttPublisher) PublishRaw(topic string, data []byte, retain ...bool) {
+	// no-op for tests
 }
 
 func TestRouter_StreamStatus(t *testing.T) {
@@ -41,10 +46,16 @@ func TestRouter_StreamStatus(t *testing.T) {
 	rm := resource.New()
 	mqttPub := &mockMqttPublisher{}
 
-	s := streamer.New(d, rm, mqttPub, tempDir)
+	isDownloading := func(videoID string) bool { return false }
+	startDownload := func(track *resolver.ResolvedTrack, onComplete func(bool)) {
+		if onComplete != nil {
+			onComplete(true)
+		}
+	}
+	s := streamer.New(d, rm, mqttPub, tempDir, 8765, isDownloading, startDownload)
 
 	// Issue token to start a session
-	token, err := s.IssueToken("video123")
+	token, err := s.IssueToken("video123", "Test Video")
 	if err != nil {
 		t.Fatalf("failed to issue token: %v", err)
 	}
@@ -323,28 +334,36 @@ func TestRouter_Placeholders(t *testing.T) {
 
 	r := New(nil, nil, nil, publishFn, nil)
 
-	cmds := []string{
-		`{"cmd": "seek", "seconds": 10}`,
-		`{"cmd": "volume", "level": 50}`,
-		`{"cmd": "mute"}`,
-	}
-
-	for _, cmd := range cmds {
-		r.Dispatch(cmd)
-	}
-	time.Sleep(50 * time.Millisecond)
+	// seek → error (not supported in stream mode)
+	r.Dispatch(`{"cmd": "seek", "seconds": 10}`)
+	// volume and mute → device_cmd (handled on-device)
+	r.Dispatch(`{"cmd": "volume", "value": 50}`)
+	r.Dispatch(`{"cmd": "mute"}`)
+	time.Sleep(100 * time.Millisecond)
 
 	mu.Lock()
+	defer mu.Unlock()
+
 	if len(published) != 3 {
-		t.Fatalf("expected 3 published messages, got %d", len(published))
+		t.Fatalf("expected 3 published messages, got %d: %v", len(published), published)
 	}
-	for i, msg := range published {
-		if msg["type"] != "error" {
-			t.Errorf("msg %d: expected error, got %v", i, msg["type"])
-		}
-		if msg["message"] != "not supported in stream mode" {
-			t.Errorf("msg %d: expected placeholder msg, got %v", i, msg["message"])
-		}
+
+	// Collect by (type, cmd) — goroutine order is not guaranteed
+	byKey := map[string]map[string]any{}
+	for _, msg := range published {
+		key := fmt.Sprintf("%v|%v", msg["type"], msg["cmd"])
+		byKey[key] = msg
 	}
-	mu.Unlock()
+
+	if _, ok := byKey["error|<nil>"]; !ok {
+		t.Errorf("seek: expected an error response, got messages: %v", published)
+	}
+	if msg, ok := byKey["device_cmd|volume"]; !ok {
+		t.Errorf("volume: expected device_cmd response, got messages: %v", published)
+	} else if msg["value"] == nil {
+		t.Errorf("volume: expected value field in device_cmd, got: %v", msg)
+	}
+	if _, ok := byKey["device_cmd|mute"]; !ok {
+		t.Errorf("mute: expected device_cmd response, got messages: %v", published)
+	}
 }
