@@ -459,7 +459,7 @@ func (r *Router) cmdClearCache(p map[string]any) {
 			return
 		}
 		if row != nil && row.FilePath != "" {
-			_ = os.Remove(row.FilePath)
+			_ = r.db.DeleteCacheFiles(videoID, row.FilePath)
 		}
 		if err := r.db.DeleteCacheByVideoID(videoID); err != nil {
 			r.publish(map[string]any{"type": "error", "message": "Failed to delete from cache: " + err.Error()})

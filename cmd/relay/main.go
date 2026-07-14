@@ -75,6 +75,10 @@ func main() {
 		log.Error("Failed to open database", "err", err)
 		os.Exit(1)
 	}
+	database.MediaDir = cfg.MediaDir
+	if err := database.MigratePathsToRelative(); err != nil {
+		log.Warn("Failed to migrate DB paths to relative", "err", err)
+	}
 
 	res := resolver.New(database, cfg)
 

@@ -275,3 +275,67 @@ func TestMediaCacheAndQueue(t *testing.T) {
 		}
 	})
 }
+
+func TestPathResolutionAndDeletion(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "db_test_paths")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer d.Close()
+
+	d.MediaDir = filepath.Join(tempDir, "media")
+	if err := os.MkdirAll(d.MediaDir, 0755); err != nil {
+		t.Fatalf("failed to create media dir: %v", err)
+	}
+
+	// Create dummy media files
+	vid1Webm := filepath.Join(d.MediaDir, "vid1.webm")
+	vid1Mkv := filepath.Join(d.MediaDir, "vid1.mkv")
+	vid1Jpg := filepath.Join(d.MediaDir, "vid1.jpg")
+
+	_ = os.WriteFile(vid1Webm, []byte("webm data"), 0644)
+	_ = os.WriteFile(vid1Mkv, []byte("mkv data"), 0644)
+	_ = os.WriteFile(vid1Jpg, []byte("jpg data"), 0644)
+
+	// Test ToRelativePath
+	rel := d.ToRelativePath(vid1Webm)
+	if rel != "vid1.webm" {
+		t.Errorf("expected relative path to be 'vid1.webm', got '%s'", rel)
+	}
+
+	// Test ResolvePath
+	resolved := d.ResolvePath("vid1.webm")
+	if resolved != vid1Webm {
+		t.Errorf("expected resolved path to be '%s', got '%s'", vid1Webm, resolved)
+	}
+
+	// Test ResolvePath with absolute path (which exists)
+	resolvedAbs := d.ResolvePath(vid1Webm)
+	if resolvedAbs != vid1Webm {
+		t.Errorf("expected resolved absolute path to remain unchanged, got '%s'", resolvedAbs)
+	}
+
+	// Test DeleteCacheFiles
+	deleted := d.DeleteCacheFiles("vid1", "vid1.webm")
+	if !deleted {
+		t.Errorf("expected DeleteCacheFiles to return true")
+	}
+
+	// Verify that vid1.webm and vid1.mkv are deleted, but vid1.jpg is NOT deleted
+	if _, err := os.Stat(vid1Webm); !os.IsNotExist(err) {
+		t.Errorf("expected vid1.webm to be deleted")
+	}
+	if _, err := os.Stat(vid1Mkv); !os.IsNotExist(err) {
+		t.Errorf("expected vid1.mkv to be deleted")
+	}
+	if _, err := os.Stat(vid1Jpg); err != nil {
+		t.Errorf("expected vid1.jpg to remain on disk")
+	}
+}

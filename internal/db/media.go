@@ -2,6 +2,9 @@ package db
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -51,6 +54,7 @@ func (d *DB) UpsertMediaCache(entry MediaCacheEntry) error {
 
 	lastAccessedStr := toDBTime(entry.LastAccessedAt)
 	createdAtStr := toDBTime(entry.CreatedAt)
+	relPath := d.ToRelativePath(entry.FilePath)
 
 	const q = `
 	INSERT INTO media_cache (video_id, title, file_path, file_size_bytes, duration_seconds, last_accessed_at, created_at)
@@ -62,7 +66,7 @@ func (d *DB) UpsertMediaCache(entry MediaCacheEntry) error {
 		duration_seconds = excluded.duration_seconds,
 		last_accessed_at = excluded.last_accessed_at
 	`
-	_, err := d.db.Exec(q, entry.VideoID, entry.Title, entry.FilePath, entry.FileSizeBytes, entry.DurationSeconds, lastAccessedStr, createdAtStr)
+	_, err := d.db.Exec(q, entry.VideoID, entry.Title, relPath, entry.FileSizeBytes, entry.DurationSeconds, lastAccessedStr, createdAtStr)
 	return err
 }
 
@@ -101,6 +105,7 @@ func (d *DB) LookupMediaCache(videoID string) (*MediaCacheEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	entry.FilePath = d.ResolvePath(entry.FilePath)
 	entry.LastAccessedAt = lastAccessed
 	entry.CreatedAt = createdAt
 	return &entry, nil
@@ -137,6 +142,7 @@ func (d *DB) GetLRUMediaFiles(limitBytes int64) ([]MediaCacheEntry, error) {
 		if err != nil {
 			return nil, err
 		}
+		entry.FilePath = d.ResolvePath(entry.FilePath)
 		entry.LastAccessedAt = lastAccessed
 		entry.CreatedAt = createdAt
 
@@ -161,6 +167,98 @@ func (d *DB) DeleteMediaCache(videoID string) error {
 	_, err := d.db.Exec(q, videoID)
 	return err
 }
+
+// DeleteCacheFiles deletes all media files from disk matching the videoID with different extensions,
+// as well as the specific filePath. Returns true if at least one file was deleted.
+func (d *DB) DeleteCacheFiles(videoID string, filePath string) bool {
+	deleted := false
+	absPath := d.ResolvePath(filePath)
+	if absPath != "" {
+		if err := os.Remove(absPath); err == nil {
+			deleted = true
+		}
+	}
+
+	if d.MediaDir != "" && videoID != "" {
+		files, err := os.ReadDir(d.MediaDir)
+		if err == nil {
+			for _, f := range files {
+				if !f.IsDir() && strings.HasPrefix(f.Name(), videoID+".") {
+					ext := filepath.Ext(f.Name())
+					// Don't delete temp files (.part, .ytdl) or thumbnail (.jpg)
+					if ext != ".part" && ext != ".ytdl" && ext != ".tmp" && ext != ".jpg" {
+						fp := filepath.Join(d.MediaDir, f.Name())
+						if fp != absPath {
+							if err := os.Remove(fp); err == nil {
+								deleted = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return deleted
+}
+
+// CacheReportEntry holds cache metadata joined with play statistics.
+type CacheReportEntry struct {
+	VideoID         string
+	Title           string
+	FilePath        string
+	FileSizeBytes   int64
+	LastAccessedAt  time.Time
+	PlayCount       int
+	LastPlayed      float64
+}
+
+// GetCacheReport returns all cached files with their play stats.
+func (d *DB) GetCacheReport() ([]CacheReportEntry, error) {
+	const q = `
+	SELECT 
+		m.video_id, 
+		m.title, 
+		m.file_path, 
+		m.file_size_bytes, 
+		m.last_accessed_at, 
+		COALESCE(MAX(s.play_count), 0) AS play_count,
+		COALESCE(MAX(s.last_played), 0) AS last_played
+	FROM media_cache m
+	LEFT JOIN song_cache s ON m.video_id = s.video_id
+	GROUP BY m.video_id
+	`
+	rows, err := d.db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []CacheReportEntry
+	for rows.Next() {
+		var entry CacheReportEntry
+		var lastAccessed time.Time
+		err := rows.Scan(
+			&entry.VideoID,
+			&entry.Title,
+			&entry.FilePath,
+			&entry.FileSizeBytes,
+			&lastAccessed,
+			&entry.PlayCount,
+			&entry.LastPlayed,
+		)
+		if err != nil {
+			return nil, err
+		}
+		entry.FilePath = d.ResolvePath(entry.FilePath)
+		entry.LastAccessedAt = lastAccessed
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 
 // EnqueueTrack appends a new track to the playback queue.
 func (d *DB) EnqueueTrack(track QueueEntry) (int64, error) {

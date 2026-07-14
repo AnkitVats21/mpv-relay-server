@@ -3,7 +3,6 @@ package eviction
 import (
 	"context"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/ankitm/mpv-relay/internal/db"
@@ -98,14 +97,11 @@ func (w *Worker) RunOnce(ctx context.Context) (filesDeleted int, bytesFreed int6
 			continue
 		}
 
-		// a. os.Remove(row.FilePath)
+		// a. Delete files from disk
 		if row.FilePath != "" {
-			if err := os.Remove(row.FilePath); err != nil {
-				if os.IsNotExist(err) {
-					w.log.Warn("Evicted file already gone from disk", "filePath", row.FilePath, "videoID", row.VideoID)
-				} else {
-					w.log.Warn("Failed to delete file from disk during eviction", "filePath", row.FilePath, "err", err)
-				}
+			deleted := w.db.DeleteCacheFiles(row.VideoID, row.FilePath)
+			if !deleted {
+				w.log.Warn("Evicted file already gone from disk", "filePath", w.db.ResolvePath(row.FilePath), "videoID", row.VideoID)
 			}
 		}
 

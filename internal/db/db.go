@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,10 +112,121 @@ type HistoryRow struct {
 
 // DB wraps the SQLite connection with write serialisation.
 type DB struct {
-	db  *sql.DB
-	mu  sync.Mutex // serialises all writes
-	log *slog.Logger
+	db       *sql.DB
+	mu       sync.Mutex // serialises all writes
+	log      *slog.Logger
+	MediaDir string
 }
+
+// ResolvePath resolves a stored path (which may be relative) against MediaDir.
+func (d *DB) ResolvePath(storedPath string) string {
+	if storedPath == "" || d.MediaDir == "" {
+		return storedPath
+	}
+	if filepath.IsAbs(storedPath) {
+		if fileExists(storedPath) {
+			return storedPath
+		}
+		filename := filepath.Base(storedPath)
+		resolved := filepath.Join(d.MediaDir, filename)
+		if fileExists(resolved) {
+			return resolved
+		}
+		return storedPath
+	}
+	return filepath.Join(d.MediaDir, storedPath)
+}
+
+// ToRelativePath converts an absolute path to a relative path against MediaDir.
+func (d *DB) ToRelativePath(absPath string) string {
+	if absPath == "" || d.MediaDir == "" {
+		return absPath
+	}
+	if !filepath.IsAbs(absPath) {
+		return absPath
+	}
+	rel, err := filepath.Rel(d.MediaDir, absPath)
+	if err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	return filepath.Base(absPath)
+}
+
+// MigratePathsToRelative converts all existing absolute paths in song_cache and media_cache to relative paths.
+func (d *DB) MigratePathsToRelative() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.MediaDir == "" {
+		return nil
+	}
+
+	// 1. Migrate media_cache
+	rows1, err := d.db.Query("SELECT video_id, file_path FROM media_cache")
+	if err != nil {
+		return err
+	}
+	defer rows1.Close()
+
+	var mediaUpdates []struct{ videoID, relPath string }
+	for rows1.Next() {
+		var videoID, fp string
+		if err := rows1.Scan(&videoID, &fp); err != nil {
+			return err
+		}
+		if filepath.IsAbs(fp) {
+			rel, err := filepath.Rel(d.MediaDir, fp)
+			if err == nil && !strings.HasPrefix(rel, "..") {
+				mediaUpdates = append(mediaUpdates, struct{ videoID, relPath string }{videoID, rel})
+			} else {
+				mediaUpdates = append(mediaUpdates, struct{ videoID, relPath string }{videoID, filepath.Base(fp)})
+			}
+		}
+	}
+	rows1.Close()
+
+	for _, up := range mediaUpdates {
+		_, err := d.db.Exec("UPDATE media_cache SET file_path = ? WHERE video_id = ?", up.relPath, up.videoID)
+		if err != nil {
+			d.log.Warn("Failed to migrate media_cache path to relative", "videoID", up.videoID, "err", err)
+		}
+	}
+
+	// 2. Migrate song_cache
+	rows2, err := d.db.Query("SELECT query, file_path FROM song_cache WHERE file_path IS NOT NULL")
+	if err != nil {
+		return err
+	}
+	defer rows2.Close()
+
+	var songUpdates []struct{ query, relPath string }
+	for rows2.Next() {
+		var query, fp string
+		if err := rows2.Scan(&query, &fp); err != nil {
+			return err
+		}
+		if filepath.IsAbs(fp) {
+			rel, err := filepath.Rel(d.MediaDir, fp)
+			if err == nil && !strings.HasPrefix(rel, "..") {
+				songUpdates = append(songUpdates, struct{ query, relPath string }{query, rel})
+			} else {
+				songUpdates = append(songUpdates, struct{ query, relPath string }{query, filepath.Base(fp)})
+			}
+		}
+	}
+	rows2.Close()
+
+	for _, up := range songUpdates {
+		_, err := d.db.Exec("UPDATE song_cache SET file_path = ? WHERE query = ?", up.relPath, up.query)
+		if err != nil {
+			d.log.Warn("Failed to migrate song_cache path to relative", "query", up.query, "err", err)
+		}
+	}
+
+	d.log.Info("DB paths migration to relative completed", "media_entries", len(mediaUpdates), "song_entries", len(songUpdates))
+	return nil
+}
+
 
 // Open opens (or creates) the database at path and runs schema migrations.
 func Open(path string) (*DB, error) {
@@ -208,7 +321,7 @@ func (d *DB) scanSong(row *sql.Row) (*SongRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.FilePath = filePath.String
+	s.FilePath = d.ResolvePath(filePath.String)
 	s.ThumbnailPath = thumbPath.String
 	s.ThumbnailURL = thumbURL.String
 	if relJSON.Valid && relJSON.String != "" {
@@ -240,7 +353,7 @@ func (d *DB) SaveSong(s *SongRow) error {
 	    thumbnail_url  = COALESCE(excluded.thumbnail_url, song_cache.thumbnail_url),
 	    related_videos = COALESCE(excluded.related_videos, song_cache.related_videos)`
 
-	fp := sql.NullString{String: s.FilePath, Valid: s.FilePath != ""}
+	fp := sql.NullString{String: d.ToRelativePath(s.FilePath), Valid: s.FilePath != ""}
 	tp := sql.NullString{String: s.ThumbnailPath, Valid: s.ThumbnailPath != ""}
 	tu := sql.NullString{String: s.ThumbnailURL, Valid: s.ThumbnailURL != ""}
 	rj := sql.NullString{String: relJSON, Valid: relJSON != ""}
@@ -256,9 +369,10 @@ func (d *DB) SaveSong(s *SongRow) error {
 func (d *DB) MarkFileDownloaded(query, filePath string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec("UPDATE song_cache SET file_path = ? WHERE query = ?", filePath, normQ(query))
+	relPath := d.ToRelativePath(filePath)
+	_, err := d.db.Exec("UPDATE song_cache SET file_path = ? WHERE query = ?", relPath, normQ(query))
 	if err == nil {
-		d.log.Info("DB: local file recorded", "query", query, "path", filePath)
+		d.log.Info("DB: local file recorded", "query", query, "path", relPath)
 	}
 	return err
 }
@@ -324,7 +438,7 @@ func (d *DB) GetHistory(n int) ([]HistoryRow, error) {
 		h.ThumbnailURL = tu.String
 		h.Uploader = up.String
 		h.Duration = int(dur.Int64)
-		h.FilePath = fp.String
+		h.FilePath = d.ResolvePath(fp.String)
 		h.Cached = h.FilePath != "" && fileExists(h.FilePath)
 		result = append(result, h)
 	}
@@ -353,7 +467,7 @@ func (d *DB) GetCachedSongs(page, limit int) ([]SongRow, int, error) {
 		}
 		s.ThumbnailPath = tp.String
 		s.ThumbnailURL = tu.String
-		s.FilePath = fp.String
+		s.FilePath = d.ResolvePath(fp.String)
 		if s.FilePath != "" && fileExists(s.FilePath) {
 			all = append(all, s)
 		} else if s.FilePath != "" {

@@ -2,10 +2,10 @@
 # Uses pure-Go SQLite (modernc.org/sqlite) so cross-compilation does not require CGO.
 
 BINARY_NAME=mpv-relay
-SIM_BINARY_NAME=esp-sim
+CACHE_TOOL_BINARY_NAME=cache-tool
 BUILD_DIR=build
 CMD_PATH=./cmd/relay
-SIM_CMD_PATH=./cmd/esp-sim
+CACHE_TOOL_CMD_PATH=./cmd/cache-tool
 
 # Go build flags
 LDFLAGS=-ldflags="-w -s"
@@ -35,8 +35,8 @@ build:
 	@echo "Building for host platform..."
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
-	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BUILD_DIR)/$(SIM_BINARY_NAME) $(SIM_CMD_PATH)
-	@echo "Built successfully: $(BUILD_DIR)/$(BINARY_NAME) and $(BUILD_DIR)/$(SIM_BINARY_NAME)"
+	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BUILD_DIR)/$(CACHE_TOOL_BINARY_NAME) $(CACHE_TOOL_CMD_PATH)
+	@echo "Built successfully: $(BUILD_DIR)/$(BINARY_NAME) and $(BUILD_DIR)/$(CACHE_TOOL_BINARY_NAME)"
 
 run:
 	CGO_ENABLED=$(CGO_ENABLED) go run $(CMD_PATH)

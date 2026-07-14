@@ -189,11 +189,40 @@ func (r *Resolver) SearchYouTube(query string, limit int) ([]db.RelatedVideo, er
 // StartBackgroundDownload kicks off a yt-dlp download in a goroutine.
 // onComplete is called with success=true/false when done.
 func (r *Resolver) StartBackgroundDownload(track *ResolvedTrack, onComplete func(bool)) {
-	target := filepath.Join(r.cfg.MusicCacheDir, track.VideoID+".mkv")
+	var target string
+	webmTarget := filepath.Join(r.cfg.MusicCacheDir, track.VideoID+".webm")
+	mkvTarget := filepath.Join(r.cfg.MusicCacheDir, track.VideoID+".mkv")
+
+	if fileExists(webmTarget) {
+		target = webmTarget
+	} else if fileExists(mkvTarget) {
+		target = mkvTarget
+	} else {
+		target = webmTarget
+	}
 
 	// Already on disk
 	if fileExists(target) {
 		_ = r.db.MarkFileDownloaded(track.Query, target)
+
+		// Ensure entry exists in media_cache as well
+		var size int64
+		if fi, err := os.Stat(target); err == nil {
+			size = fi.Size()
+		}
+		mediaEntry := db.MediaCacheEntry{
+			VideoID:         track.VideoID,
+			Title:           track.Title,
+			FilePath:        target,
+			FileSizeBytes:   size,
+			DurationSeconds: track.Duration,
+			LastAccessedAt:  time.Now(),
+			CreatedAt:       time.Now(),
+		}
+		if err := r.db.UpsertMediaCache(mediaEntry); err != nil {
+			r.log.Warn("Failed to heal media cache entry", "videoID", track.VideoID, "err", err)
+		}
+
 		if onComplete != nil {
 			onComplete(true)
 		}
@@ -570,6 +599,25 @@ func (r *Resolver) downloadWorker(track *ResolvedTrack, target string, onComplet
 		r.log.Info("BG download complete", "target", target)
 		_ = r.db.MarkFileDownloaded(track.Query, target)
 		track.FilePath = target
+
+		// Ensure entry exists in media_cache as well
+		var size int64
+		if fi, err := os.Stat(target); err == nil {
+			size = fi.Size()
+		}
+		mediaEntry := db.MediaCacheEntry{
+			VideoID:         track.VideoID,
+			Title:           track.Title,
+			FilePath:        target,
+			FileSizeBytes:   size,
+			DurationSeconds: track.Duration,
+			LastAccessedAt:  time.Now(),
+			CreatedAt:       time.Now(),
+		}
+		if err := r.db.UpsertMediaCache(mediaEntry); err != nil {
+			r.log.Warn("Failed to insert media cache entry", "videoID", track.VideoID, "err", err)
+		}
+
 		success = true
 	} else {
 		r.log.Warn("BG download failed", "err", err, "output", string(out))
