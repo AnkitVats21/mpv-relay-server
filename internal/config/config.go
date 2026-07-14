@@ -95,7 +95,7 @@ func Load() (*Config, error) {
 	}
 	cfg.MQTTPort = port
 
-	httpPort, err := strconv.Atoi(getOr("HTTP_STREAM_PORT", "8765"))
+	httpPort, err := strconv.Atoi(getOr("HTTP_STREAM_PORT", "443"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid HTTP_STREAM_PORT: %w", err)
 	}

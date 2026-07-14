@@ -49,6 +49,22 @@ func findYtDlp() string {
 	return "yt-dlp"
 }
 
+// findFFmpeg looks for the ffmpeg binary path in the environment or PATH.
+func findFFmpeg() string {
+	if v := os.Getenv("FFMPEG_BIN"); v != "" {
+		return v
+	}
+	exe, _ := os.Executable()
+	candidate := filepath.Join(filepath.Dir(exe), "bin", "ffmpeg")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	if p, err := exec.LookPath("ffmpeg"); err == nil {
+		return p
+	}
+	return "ffmpeg"
+}
+
 // BuildFFmpegFromFile returns an exec.Cmd that reads a local file
 // and outputs raw PCM to stdout.
 // seekSeconds > 0 inserts -ss <seekSeconds> before -i for pause/resume.
@@ -67,7 +83,7 @@ func BuildFFmpegFromFile(ctx context.Context, filePath string, seekSeconds float
 		"-",
 	)
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, findFFmpeg(), args...)
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			return cmd.Process.Signal(os.Kill)
@@ -102,14 +118,18 @@ func BuildYtDlpStream(ctx context.Context, videoID string) *exec.Cmd {
 // BuildFFmpegFromStdin returns an exec.Cmd reading from stdin (connected to yt-dlp).
 func BuildFFmpegFromStdin(ctx context.Context) *exec.Cmd {
 	args := []string{
+		// 1. Tell FFmpeg the format of the incoming stdin stream BEFORE opening it
+		"-f", "matroska", 
 		"-i", "-",
+		
+		// 2. Output configurations (your existing code)
 		"-f", Format,
 		"-acodec", Codec,
 		"-ar", SampleRate,
 		"-ac", Channels,
 		"-",
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, findFFmpeg(), args...)
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			return cmd.Process.Signal(os.Kill)

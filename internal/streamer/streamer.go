@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,36 +82,13 @@ func (s *Streamer) RegisterHTTPHandler(mux *http.ServeMux) {
 // fromChunk > 0 causes the manifest URL to include &from_chunk=N so the ESP
 // resumes from that chunk index (used for pause/resume).
 func (s *Streamer) StartStream(videoID, title string, fromChunk ...uint32) error {
-	from := uint32(0)
-	if len(fromChunk) > 0 {
-		from = fromChunk[0]
-	}
-
-	token, err := s.IssueToken(videoID, title)
-	if err != nil {
-		return fmt.Errorf("IssueToken: %w", err)
-	}
-
-	manifestURL := fmt.Sprintf("%s/stream/manifest?token=%s", s.streamerURL, token)
-	if from > 0 {
-		manifestURL += "&from_chunk=" + strconv.FormatUint(uint64(from), 10)
-	}
-
-	s.log.Info("Issuing START_STREAM", "videoID", videoID, "token", token,
-		"manifestURL", manifestURL, "fromChunk", from)
-
-	s.mqtt.Publish(map[string]any{
-		"type":         "START_STREAM",
-		"cmd":          "START_STREAM",
-		"video_id":     videoID,
-		"title":        title,
-		"token":        token,
-		"manifest_url": manifestURL,
-	})
+	s.session.Lock()
+	s.session.ActiveVideoID = videoID
+	s.session.Unlock()
 
 	// ── New Ogg streaming support ──
-	localIP := getLocalIP()
-	playbackURL := fmt.Sprintf("http://%s:%d/stream?song_id=%s", localIP, s.httpStreamPort, videoID)
+	baseURL := s.getStreamerBaseURL()
+	playbackURL := fmt.Sprintf("%s/stream?song_id=%s", baseURL, videoID)
 
 	filePath, _ := s.resolveCachedPath(videoID)
 	if filePath != "" && fileExists(filePath) {
@@ -207,6 +186,36 @@ func getLocalIP() string {
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP.String()
+}
+
+func (s *Streamer) getStreamerBaseURL() string {
+	scheme := "http"
+	if os.Getenv("STREAMER_HTTPS") == "true" {
+		scheme = "https"
+	}
+
+	if s.streamerURL != "" {
+		rawURL := s.streamerURL
+		if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+			rawURL = scheme + "://" + rawURL
+		}
+
+		if u, err := url.Parse(rawURL); err == nil {
+			host := u.Hostname()
+			if host != "" && host != "localhost" && host != "127.0.0.1" && host != "0.0.0.0" {
+				if scheme == "https" {
+					u.Scheme = "https"
+					u.Host = host // strips port if present
+				}
+				return strings.TrimSuffix(u.String(), "/")
+			}
+		}
+	}
+
+	if scheme == "https" {
+		return fmt.Sprintf("https://%s", getLocalIP())
+	}
+	return fmt.Sprintf("http://%s:%d", getLocalIP(), s.httpStreamPort)
 }
 
 func fileExists(path string) bool {

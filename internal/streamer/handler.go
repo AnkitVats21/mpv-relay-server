@@ -277,7 +277,12 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ffmpeg",
+	ffmpegBin := os.Getenv("FFMPEG_BIN")
+	if ffmpegBin == "" {
+		ffmpegBin = "ffmpeg"
+	}
+
+	cmd := exec.CommandContext(ctx, ffmpegBin,
 		"-i", "-",
 		"-c:a", "libopus",
 		"-ar", "48000",
