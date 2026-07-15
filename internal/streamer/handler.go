@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ankitm/mpv-relay/internal/db"
 )
 
 // Manifest is the JSON payload returned by GET /stream/manifest.
@@ -187,6 +189,22 @@ func (s *Streamer) resolveCachedPath(videoID string) (filePath string, durationS
 	// 2. song_cache table (fallback)
 	if row, err := s.db.LookupVideoID(videoID); err == nil && row != nil && row.FilePath != "" {
 		if _, err := os.Stat(row.FilePath); err == nil {
+			// Found in song_cache but not media_cache. Heal media_cache!
+			var size int64
+			if fi, err := os.Stat(row.FilePath); err == nil {
+				size = fi.Size()
+			}
+			mediaEntry := db.MediaCacheEntry{
+				VideoID:         videoID,
+				Title:           row.Title,
+				FilePath:        row.FilePath,
+				FileSizeBytes:   size,
+				DurationSeconds: row.Duration,
+				LastAccessedAt:  time.Now(),
+				CreatedAt:       time.Now(),
+			}
+			_ = s.db.UpsertMediaCache(mediaEntry)
+
 			return row.FilePath, float64(row.Duration)
 		}
 	}
@@ -195,7 +213,38 @@ func (s *Streamer) resolveCachedPath(videoID string) (filePath string, durationS
 	for _, ext := range []string{".mkv", ".webm", ".opus", ".m4a", ".mp3"} {
 		p := filepath.Join(s.mediaDir, videoID+ext)
 		if _, err := os.Stat(p); err == nil {
-			return p, 0 // duration unknown without DB
+			// Found on disk, but missing from both db tables. Heal both!
+			var size int64
+			if fi, err := os.Stat(p); err == nil {
+				size = fi.Size()
+			}
+			title := videoID
+			duration := 0
+
+			// 3a. Save to song_cache
+			newSong := &db.SongRow{
+				Query:      videoID,
+				VideoID:    videoID,
+				Title:      title,
+				Duration:   duration,
+				FilePath:   p,
+				LastPlayed: float64(time.Now().UnixMilli()) / 1000.0,
+			}
+			_ = s.db.SaveSong(newSong)
+
+			// 3b. Save to media_cache
+			mediaEntry := db.MediaCacheEntry{
+				VideoID:         videoID,
+				Title:           title,
+				FilePath:        p,
+				FileSizeBytes:   size,
+				DurationSeconds: duration,
+				LastAccessedAt:  time.Now(),
+				CreatedAt:       time.Now(),
+			}
+			_ = s.db.UpsertMediaCache(mediaEntry)
+
+			return p, 0
 		}
 	}
 

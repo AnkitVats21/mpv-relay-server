@@ -554,4 +554,93 @@ func (d *DB) GetCacheTotalSize() (int64, error) {
 	return sum, err
 }
 
+// SyncCacheDir scans the media directory and registers any untracked audio files in the database.
+func (d *DB) SyncCacheDir() error {
+	if d.MediaDir == "" {
+		return nil
+	}
+
+	files, err := os.ReadDir(d.MediaDir)
+	if err != nil {
+		return err
+	}
+
+	// Fetch all current references
+	entries, err := d.GetCacheReport()
+	if err != nil {
+		return err
+	}
+
+	refVideoIDs := make(map[string]bool)
+	for _, e := range entries {
+		refVideoIDs[e.VideoID] = true
+	}
+
+	var syncedCount int
+	for _, f := range files {
+		if f.IsDir() || strings.HasPrefix(f.Name(), ".") {
+			continue
+		}
+
+		ext := filepath.Ext(f.Name())
+		// Only sync media audio files
+		if ext != ".webm" && ext != ".mkv" && ext != ".opus" && ext != ".m4a" && ext != ".mp3" {
+			continue
+		}
+
+		parts := strings.Split(f.Name(), ".")
+		videoID := parts[0]
+
+		if !refVideoIDs[videoID] {
+			info, err := f.Info()
+			size := int64(0)
+			if err == nil {
+				size = info.Size()
+			}
+			filePath := filepath.Join(d.MediaDir, f.Name())
+			title := videoID
+			duration := 0
+
+			// 1. Check if it exists in song_cache
+			if song, err := d.LookupVideoID(videoID); err == nil && song != nil {
+				title = song.Title
+				duration = song.Duration
+				if song.FilePath == "" {
+					_ = d.MarkVideoDownloaded(videoID, filePath)
+				}
+			} else {
+				// Create song_cache entry
+				newSong := &SongRow{
+					Query:      videoID,
+					VideoID:    videoID,
+					Title:      title,
+					Duration:   duration,
+					FilePath:   filePath,
+					LastPlayed: float64(time.Now().UnixMilli()) / 1000.0,
+				}
+				_ = d.SaveSong(newSong)
+			}
+
+			// 2. Create media_cache entry
+			mediaEntry := MediaCacheEntry{
+				VideoID:         videoID,
+				Title:           title,
+				FilePath:        filePath,
+				FileSizeBytes:   size,
+				DurationSeconds: duration,
+				LastAccessedAt:  time.Now(),
+				CreatedAt:       time.Now(),
+			}
+			if err := d.UpsertMediaCache(mediaEntry); err == nil {
+				syncedCount++
+			}
+		}
+	}
+
+	if syncedCount > 0 {
+		d.log.Info("Synced untracked files from cache directory to DB", "count", syncedCount)
+	}
+	return nil
+}
+
 

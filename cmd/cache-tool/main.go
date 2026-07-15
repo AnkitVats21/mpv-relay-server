@@ -53,6 +53,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: path migration failed: %v\n", err)
 	}
 
+	// Auto-sync media folder files into the DB
+	if err := database.SyncCacheDir(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cache synchronization failed: %v\n", err)
+	}
+
 	// Fetch cache report
 	entries, err := database.GetCacheReport()
 	if err != nil {

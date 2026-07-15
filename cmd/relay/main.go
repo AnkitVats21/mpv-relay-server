@@ -79,6 +79,11 @@ func main() {
 	if err := database.MigratePathsToRelative(); err != nil {
 		log.Warn("Failed to migrate DB paths to relative", "err", err)
 	}
+	go func() {
+		if err := database.SyncCacheDir(); err != nil {
+			log.Warn("Failed to sync cache directory to DB", "err", err)
+		}
+	}()
 
 	res := resolver.New(database, cfg)
 
